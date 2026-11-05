@@ -1,0 +1,52 @@
+# Non-Commercial Source-Available License & Financial Software Disclaimer
+
+**Copyright (c) 2026 Skilov3. All rights reserved.**
+
+---
+
+### 1. License Grant (Personal, Educational & Research Use Only)
+
+Permission is hereby granted to any person obtaining a copy of this software and associated documentation files (the "Software") to inspect, view, compile, and run the Software **solely for personal, educational, non-commercial research, and evaluation purposes**, subject to the terms and restrictions set forth below.
+
+---
+
+### 2. Commercial Use Prohibitions & Anti-Theft Restrictions
+
+**COMMERCIAL EXPLOITATION OF THIS SOFTWARE IS STRICTLY PROHIBITED.**
+
+Without the express, prior written authorization of the copyright holder, you may NOT:
+1. **Sell, Resell, or Monetize:** Sell, resell, rent, lease, sublicense, distribute, or otherwise commercially exploit the Software, its source code, compiled binaries, trading strategies, mathematical indicators, or any derivative works.
+2. **Paid Trading / Signal Services:** Use the Software (or any portion thereof) to operate a commercial trading service, paid alert/signal feed, managed account service, copy-trading pool, or proprietary trading fund.
+3. **Closed-Source Repackaging:** Re-package, re-brand, obfuscate, or embed the Software or its proprietary algorithms into commercial, closed-source, or proprietary products.
+4. **Remove Copyright Notices:** Alter, obscure, or remove any copyright notices, license texts, or authorship attributions contained in the Software.
+
+Any unauthorized commercial use, distribution, or resale shall constitute copyright infringement and intellectual property misappropriation under applicable domestic and international laws.
+
+---
+
+### 3. Modifications and Derivative Works
+
+You may modify the Software for your own personal, non-commercial use, provided that:
+- Any distributed forks or public copies must include this exact `LICENSE` file and prominent notices stating that you changed the files.
+- Derivative works remain subject to the non-commercial restrictions set forth in Section 2.
+
+---
+
+### 4. CFTC / Regulatory & Algorithmic Trading Disclaimer
+
+**THIS SOFTWARE IS FOR EDUCATIONAL AND RESEARCH PURPOSES ONLY. IT IS NOT FINANCIAL ADVICE, INVESTMENT ADVICE, OR A SOLICITATION TO TRADE SECURITIES OR FUTURES CONTRACTS.**
+
+1. **High Risk of Futures Trading:** Futures, options, and foreign exchange trading involve substantial risk of loss and are not suitable for every investor. An investor could potentially lose all or more than their initial investment.
+2. **Hypothetical & Simulated Results Disclaimer (CFTC Rule 4.41):**
+   > *Hypothetical or simulated performance results have certain inherent limitations. Unlike an actual performance record, simulated results do not represent actual trading. Also, since the trades have not actually been executed, the results may have under- or over-compensated for the impact, if any, of certain market factors, such as lack of liquidity. Simulated trading programs in general are also subject to the fact that they are designed with the benefit of hindsight. No representation is being made that any account will or is likely to achieve profits or losses similar to those shown.*
+3. **No Guarantee of Success:** The author makes no representations, warranties, or guarantees that the automated strategies, indicators, risk models, or optimization routines provided in this Software will result in profitable trading or achieve passing criteria in prop firm combines (including TopstepX).
+
+---
+
+### 5. Disclaimer of Warranties & Limitation of Liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, ACCURACY, AND NON-INFRINGEMENT.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER, CONTRIBUTORS, OR AFFILIATED PARTIES BE LIABLE FOR ANY CLAIM, DAMAGES, LOSSES (INCLUDING, WITHOUT LIMITATION, DIRECT, INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE LOSSES, LOSS OF TRADING CAPITAL, LOST PROFITS, BROKER EXECUTION FEES, ACCOUNT LIQUIDATIONS, SYSTEM DOWNTIME, OR DATA LOSS), WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+BY CLONING, DOWNLOADING, RUNNING, OR VIEWING THIS REPOSITORY, YOU EXPRESSLY ACKNOWLEDGE AND AGREE TO ALL TERMS AND DISCLAIMERS STATED ABOVE.

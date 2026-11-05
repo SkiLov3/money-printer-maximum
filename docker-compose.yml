@@ -1,0 +1,30 @@
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  bot:
+    build: .
+    container_name: topstepx_bot
+    command: sh -c "sleep 2 && python main.py"
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8765}:8765"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=host.docker.internal:11434
+    # Resource limits to protect host machine
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 2G
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./docs:/app/docs
+    logging: *default-logging

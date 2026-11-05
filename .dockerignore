@@ -1,0 +1,65 @@
+# Git
+.git
+.gitignore
+
+# Environments
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VSCode / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+logs/
+data/
+reports/
+docs/
+archive/
+scripts/archive/
+scratch/
+.pytest_cache/
+.ruff_cache/
+tool-outputs/
+.serena/
+.gemini/
+.pi/
+.agents/
+AGENTS.md
+CLAUDE.md
+scripts/pre_pr_swarm_review.py
+scripts/deep_dive_ny_session_adx.py
+scripts/ollama_mcp_server.py
+scripts/semantic_code_search.py
+tests/test_ollama_mcp_server.py

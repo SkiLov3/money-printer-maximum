@@ -1,0 +1,33 @@
+---
+orchestrator:
+  window_size_trading_days: 22
+  max_windows: 12
+  strategy_name: swarm_stack
+
+discovery:
+  min_trades_per_window: 5
+  hypothesis_enabled: false
+  absorb_changes: false
+
+reporting:
+  reports_dir: reports/discovery_loop
+
+claude:
+  enabled: false
+  model: "claude-sonnet-5.5"
+  command: ["claude", "-p", "--model", "claude-sonnet-5.5"]
+  timeout_seconds: 600
+
+codex:
+  enabled: false
+  command: ["codex", "exec", "--full-auto"]
+  timeout_seconds: 600
+
+gemini:
+  enabled: false
+  command: ["gemini", "-p"]
+  timeout_seconds: 600
+
+external_agents:
+  max_provider_calls_per_run: 1
+  max_prompt_chars: 8000

@@ -1,0 +1,360 @@
+# Example stack configuration (generic starter values - NOT a recommendation).
+# Copy to config/trading_stack.yaml (git-ignored) and tune for your research:
+#   cp config/trading_stack.example.yaml config/trading_stack.yaml
+strategies:
+  blender:
+    mode: priority_first
+    multi_agree_bonus: 0.0
+  discovery:
+    enabled: true
+    advisory_failure_similarity_threshold: 0.90
+    advisory_success_similarity_threshold: 0.75
+  direction_filters:
+    mtf_trend_scalper: [buy, sell]
+    golden_zone_scalper: [buy, sell]
+    price_action_bs: [buy, sell]
+    orb_vwap: [buy, sell]
+  strategies:
+    # Institutional 5-Minute Multi-Timeframe Trend & VWAP System
+    - name: mtf_trend_scalper
+      enabled: true
+      priority: 150
+      params:
+        enabled_symbols: ["MES"]
+        htf_minutes: 15
+        ltf_minutes: 5
+        min_adx: 25.0
+        sl_atr_mult: 1.5
+        tp_atr_mult: 3.0
+        allowed_entry_hours_et: [9, 10, 11, 12, 13, 14, 15]
+
+    - name: price_action_bs
+      enabled: false
+      priority: 100
+      params:
+        enabled_symbols: ["MNQ"]
+        tick_size: 0.10
+        quantity: 2
+        warmup_bars: 120
+        ema_period: 21
+        ema_distance_filter_ticks: 10
+        min_close_ema_distance_ticks: 3.0
+        min_body_ratio: 0.30
+        chop_ema_flat_ticks: 2.0
+        ema_slope_min: 0.35
+        target_mode: risk_multiple
+        risk_reward: 2.2
+        min_target_ticks: 15
+        max_target_ticks: 600
+        min_stop_atr_mult: 1.0
+        min_stop_ticks: 30
+        max_stop_ticks: 60
+        use_candidate_price_targets: true
+        skip_large_signal_bars: true
+        large_signal_bar_threshold_ticks: 25
+        min_signal_bar_atr_ratio: 0.50
+        fractal_length: 2
+        min_leg_ticks: 2
+        min_leg_bars: 1
+        pullback_lookback_bars: 40
+        signal_after_pivot_bars: 15
+        failure_window_bars: 8
+        range_detection_bars: 60
+        range_cluster_tolerance_ticks: 3
+        range_min_width_ticks: 8
+        range_max_width_ticks: 120
+        range_double_test_use_visual_range: true
+        range_double_test_breakout_ticks: 1
+        range_double_test_lookback_bars: 30
+        range_double_test_min_separation_bars: 3
+        vol_spike_atr_mult: 3.5
+        vol_spike_release_mult: 2.0
+        vol_spike_release_bars: 3
+        session_cutoff_enabled: true
+        allowed_entry_hours_et: [8, 9, 10, 11, 12, 13, 14, 15]
+        no_new_entries_after_et: "15:30"
+        enabled_setups:
+          - E-01
+          - E-02
+          - E-03
+          - E-04
+          - E-05
+          - E-06
+          - E-07
+          - E-11
+        symbol_params:
+          MNQ:
+            tick_size: 0.25
+            ema_distance_filter_ticks: 15
+            large_signal_bar_threshold_ticks: 25
+            min_stop_ticks: 60
+            max_stop_ticks: 150
+            min_close_ema_distance_ticks: 12.0
+          MES:
+            tick_size: 0.25
+            ema_distance_filter_ticks: 10
+            large_signal_bar_threshold_ticks: 15
+            min_stop_ticks: 24
+            max_stop_ticks: 80
+          MGC:
+            tick_size: 0.1
+            ema_distance_filter_ticks: 10
+            large_signal_bar_threshold_ticks: 15
+            min_stop_ticks: 25
+            max_stop_ticks: 60
+            min_close_ema_distance_ticks: 5.0
+            min_body_ratio: 0.50
+          MCL:
+            tick_size: 0.01
+            ema_distance_filter_ticks: 8
+            large_signal_bar_threshold_ticks: 15
+            min_stop_ticks: 25
+            max_stop_ticks: 60
+            min_close_ema_distance_ticks: 2.5
+
+    - name: golden_zone_scalper
+      enabled: false
+      priority: 120
+      params:
+        lookback: 48
+        trigger_lookback: 3
+        ema_fast: ema_21
+        ema_slow: ema_50
+        min_adx: 25.0
+        min_ema_slope_ticks: 2.0
+        zone_min: 0.382
+        zone_max: 0.618
+        breakout_buffer_ticks: 1
+        stop_buffer_ticks: 2
+        min_stop_ticks: 16
+        risk_reward: 2.2
+        min_target_ticks: 15
+        min_body_ratio: 0.35
+        require_engulfing: false
+        allowed_entry_hours_et: [9, 10, 11, 12, 13, 14, 15]
+        enabled_symbols: ["MCL", "MNQ"]
+        symbol_params:
+          MNQ:
+            max_stop_ticks: 80
+            min_adx: 25.0
+          MGC:
+            max_stop_ticks: 50
+            min_adx: 25.0
+          MCL:
+            max_stop_ticks: 50
+            min_adx: 25.0
+          MES:
+            max_stop_ticks: 40
+            min_adx: 25.0
+
+    - name: sss
+      enabled: false
+      priority: 60
+      params:
+        sl_ticks: 40
+        tp_ticks: 80
+        min_confluence: 4
+        symbol_params:
+          MNQ:
+            min_sl_ticks: 100
+          MCL:
+            min_sl_ticks: 40
+          MGC:
+            min_sl_ticks: 40
+
+    - name: ema_pullback
+      enabled: false
+      priority: 70
+      params:
+        sl_ticks: 40
+        tp_ticks: 80
+        symbol_params:
+          MNQ:
+            min_sl_ticks: 100
+          MES:
+            min_sl_ticks: 30
+          MCL:
+            min_sl_ticks: 30
+          MGC:
+            min_sl_ticks: 30
+
+    - name: orb_vwap
+      enabled: true
+      priority: 200
+      params:
+        enabled_symbols: ["MCL"]
+        # ── NY Session ──
+        opening_range_enabled: false
+        direction_mode: fade
+        opening_range_start_et: "09:30"
+        opening_range_end_et: "09:35"
+        trade_window_end_et: "14:00"
+        use_vwap_filter: false
+        use_ema200_filter: false
+        min_volume_ratio: 0.0
+        target_mode: risk_multiple
+        risk_reward: 2.0
+        fixed_target_ticks: 40
+        stop_buffer_ticks: 2
+        breakout_buffer_ticks: 1
+        max_one_trade_per_session: true
+
+        # ── Asian Session ──
+        min_or_ticks: 10
+        asian_enabled: true
+        asian_opening_range_start_et: "18:00"
+        asian_opening_range_end_et: "18:10"
+        asian_trade_window_end_et: "20:30"
+        asian_direction_mode: fade
+        asian_risk_reward: 2.0
+        asian_min_or_ticks: 10
+        asian_use_vwap_filter: false
+
+# yamllint disable rule:line-length
+symbol_brackets:
+  NQ: {sl: 120, tp: 300, min_atr: 5.0, max_atr: 80.0, tick_size: 0.25, tick_value: 5.0}
+  ENQ: {sl: 120, tp: 300, min_atr: 5.0, max_atr: 80.0, tick_size: 0.25, tick_value: 5.0}
+  YM: {sl: 30, tp: 60, min_atr: 2.0, max_atr: 100.0, tick_size: 1.0, tick_value: 5.0}
+  CL: {sl: 60, tp: 150, min_atr: 0.05, max_atr: 0.45, tick_size: 0.01, tick_value: 10.0}
+  GC: {sl: 30, tp: 60, min_atr: 1.0, max_atr: 6.0, tick_size: 0.1, tick_value: 10.0}
+  MCL: {sl: 90, tp: 220, min_atr: 0.05, max_atr: 0.45, tick_size: 0.01, tick_value: 1.0}
+  MGC: {sl: 60, tp: 150, min_atr: 1.0, max_atr: 6.0, tick_size: 0.1, tick_value: 1.0}
+  MNQ: {sl: 120, tp: 300, min_atr: 5.0, max_atr: 80.0, tick_size: 0.25, tick_value: 0.50}
+  MES: {sl: 40, tp: 100, min_atr: 1.0, max_atr: 20.0, tick_size: 0.25, tick_value: 1.25}
+  6E: {sl: 40, tp: 100, min_atr: 0.0002, max_atr: 0.0050, tick_size: 0.00005, tick_value: 6.25}
+  M6E: {sl: 40, tp: 100, min_atr: 0.0002, max_atr: 0.0050, tick_size: 0.00005, tick_value: 0.625}
+  NKD: {sl: 10, tp: 25, min_atr: 10.0, max_atr: 200.0, tick_size: 5.0, tick_value: 25.0}
+  MNK: {sl: 10, tp: 25, min_atr: 10.0, max_atr: 200.0, tick_size: 5.0, tick_value: 2.50}
+# yamllint enable rule:line-length
+
+routing:
+  enabled: true
+  risk_per_trade_pct: 0.18    # Equity % risked per trade - set your own
+  daily_profit_target: 1500
+  daily_loss_halt: 350
+  max_consecutive_losses: 2
+  entry_filters:
+    market_hours: true
+    news_standdown: true
+    near_close: true
+    cooldown: true
+    max_positions: true
+    pending_order: true
+    allow_flips: false
+
+commissions:
+  full: 2.10
+  micro: 0.62
+  MNQ: 0.62
+  MES: 0.62
+  MCL: 0.62
+  MGC: 0.62
+  MYM: 0.62
+  NQ: 2.10
+  ES: 2.10
+  CL: 2.10
+  GC: 2.10
+  YM: 2.10
+  6E: 2.10
+  M6E: 0.62
+
+feature_flags:
+  routing_enabled: true
+  zone_engine_enabled: false
+  health_monitor_enabled: true
+  discovery_enabled: true
+  database_enabled: true
+  instrument_sizing_enabled: true
+  volatility_sizing_enabled: true
+
+database:
+  enabled: true
+  backend: sqlite
+  sqlite_path: logs/swarm.db
+
+
+optimization:
+  discovery:
+    enabled: true
+    provider: claude
+    model: claude-sonnet-5.5
+    command: ["claude", "-p", "--model", "claude-sonnet-5.5"]
+    batch_size: 10
+    similarity_threshold: 0.85
+    min_samples: 5
+    advisory_failure_similarity_threshold: 0.90
+    advisory_success_similarity_threshold: 0.75
+    embedding_window: 120
+    max_recent_failures: 12
+    timeframes: ["1m", "5m", "15m"]
+    max_bars_per_sample: 120
+  learning_review:
+    enabled: true
+    provider: claude
+    model: claude-sonnet-5.5
+    command: ["claude", "-p", "--model", "claude-sonnet-5.5"]
+    batch_size: 8
+    max_provider_calls_per_batch: 1
+    max_prompt_chars: 12000
+
+combine:
+  topstep_50k:
+    starting_balance: 50000
+    profit_target: 3000
+    max_loss_limit: 2000
+    trailing_max_loss: true
+    consistency_max_best_day_pct: 50
+    evaluate_daily_loss: false
+    daily_loss_limit: 1000
+    max_contracts: 5
+    max_micros: 50
+  topstep_50k_daily_enforced:
+    starting_balance: 50000
+    profit_target: 3000
+    max_loss_limit: 2000
+    trailing_max_loss: true
+    consistency_max_best_day_pct: 50
+    evaluate_daily_loss: true
+    daily_loss_limit: 1000
+    max_contracts: 5
+    max_micros: 50
+  topstep_100k:
+    starting_balance: 100000
+    profit_target: 6000
+    max_loss_limit: 3000
+    trailing_max_loss: true
+    consistency_max_best_day_pct: 50
+    evaluate_daily_loss: false
+    daily_loss_limit: 2000
+    max_contracts: 10
+    max_micros: 100
+  stress_strict_consistency:
+    starting_balance: 50000
+    profit_target: 3000
+    max_loss_limit: 2000
+    trailing_max_loss: true
+    consistency_max_best_day_pct: 35
+    evaluate_daily_loss: true
+    daily_loss_limit: 800
+    max_contracts: 5
+    max_micros: 50
+
+zones:
+  enabled: false
+  minimum_bars: 120
+  lookback: 80
+  pivot_window: 4
+  zone_half_atr: 0.5
+  max_distance_atr: 1.0
+  entry_distance_atr: 0.35
+  quantity: 1
+  sl_ticks: 48
+  tp_ticks: 96
+  merge_overlap: true
+
+health:
+  enabled: true
+  max_events: 50
+  drought_threshold_seconds: 1800
+  rejection_rate_threshold: 0.7
+  tighten_after_accepts: 5

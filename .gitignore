@@ -1,0 +1,78 @@
+# Environment variables
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv
+.env
+.tox
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# Project artifacts & directories
+logs/
+data/
+reports/
+docs/
+archive/
+scripts/archive/
+.idea/
+.vscode/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+
+# Private live strategy config (copy from config/trading_stack.example.yaml)
+config/trading_stack.yaml
+config/aggressive_gz_legacy_50k.yaml
+config/backups/
+
+# Local AI / Agent / Developer Workflow Files
+AGENTS.md
+CLAUDE.md
+scripts/pre_pr_swarm_review.py
+scripts/deep_dive_ny_session_adx.py
+scripts/ollama_mcp_server.py
+scripts/semantic_code_search.py
+scripts/backup_private_state.sh
+tests/test_ollama_mcp_server.py
+
+# Generated results (backtest outputs, html, csv)
+*_results*.json
+backtest_*.json
+*.html
+data/*_auto_fetch.csv
+
+# Serena configuration
+.serena
+
+# Local AI Prompts
+*prompt.txt
+
+# Gemini, Pi, and Agent configurations
+.gemini
+.gemini/
+.gemini/**
+.pi
+.pi/
+.pi/**
+.agents
+.agents/
+.agents/**
+
+# Scratch & diff files
+scratch/
+diff.txt
+

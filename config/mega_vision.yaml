@@ -1,0 +1,18 @@
+---
+mode: shadow
+external_calls_enabled: false
+shadow_model: "claude-sonnet-5-5"
+live_model: "claude-sonnet-5-5"
+subscription_mode: true
+kill_switch_env_var: "MEGA_VISION_KILL_SWITCH"
+max_retries_per_decision: 2
+fallback_on_timeout_seconds: 30
+
+claude:
+  command: ["claude", "-p", "--model", "claude-sonnet-5.5"]
+
+codex:
+  command: ["codex", "exec", "--full-auto"]
+
+gemini:
+  command: ["gemini", "-p"]
