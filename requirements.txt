@@ -8,4 +8,4 @@ python-json-logger==2.0.7
 pytest==8.3.4
 pytz==2024.2
 PyYAML==6.0.2
-claude-agent-sdk==0.1.0
+claude-agent-sdk==0.2.121
