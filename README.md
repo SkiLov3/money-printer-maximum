@@ -2,11 +2,15 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-green.svg)](https://www.docker.com/)
-[![Hardware](https://img.shields.io/badge/apple%20silicon-128GB%20unified-purple.svg)]()
+[![License: Source-Available](https://img.shields.io/badge/license-source--available-yellow.svg)](LICENSE)
+[![Prop Firm: TopstepX](https://img.shields.io/badge/prop%20firm-TopstepX-orange.svg)](https://www.topstep.com)
+[![Hardware: Metal GPU](https://img.shields.io/badge/apple%20silicon-Metal%20GPU-purple.svg)](https://developer.apple.com/metal/)
 
 Autonomous, local-first algorithmic trading swarm engineered for **TopstepX Prop Combines** (Micro WTI Crude Oil `MCL`, Micro E-mini S&P 500 `MES`, and Micro Gold `MGC`).
 
 Features real-time SignalR WebSocket streaming, REST order routing, bracket lifecycle tracking, an institutional live ops dashboard, and an autonomous offline Saturday Multi-LLM optimizer relay running locally on Apple Silicon Metal GPU.
+
+**[Architecture](#1-system-architecture)** • **[Strategy Stack](#2-strategy-stack-example-configuration)** • **[Combine Safety](#3-risk-management--prop-combine-invariants)** • **[Quickstart](#4-quickstart--deployment)** • **[Saturday Optimizer](#5-saturday-autonomous-multi-llm-relay)** • **[License](#7-license--disclaimers)**
 
 > **⚠️ Disclaimer:** This project is for **educational and research purposes only** and is **not financial advice**. Futures trading involves substantial risk of loss. The parameters shown here are examples from one author's research and are **not** a recommendation. Use at your own risk, only with your own TopstepX/ProjectX credentials, and start in `MODE=simulation`. See [LICENSE](LICENSE).
 
@@ -87,6 +91,24 @@ The bot enforces strict TopstepX combine safety inside [`src/agents/risk_agent.p
 - Docker & Docker Compose
 - Python 3.11+ (for local scripts / optimizer)
 - Native Ollama (for offline Saturday Optimizer: `qwen3.5:122b`, `llama3.3:70b`, `codestral:22b`)
+
+### Project Layout
+
+```text
+money-printer-maximum/
+├── config/              # Strategy stack & loop parameter YAMLs
+│   └── trading_stack.example.yaml
+├── src/
+│   ├── agents/          # Supervisor, Risk, Data, Execution agents
+│   ├── api/             # TopstepX REST & SignalR WebSocket client
+│   ├── strategies/      # Deterministic MTF Scalper & Asian ORB strategies
+│   └── persistence/     # SQLite trade and session ledger
+├── scripts/             # Saturday multi-LLM optimizer & backtesting tools
+├── tests/               # 289-test hermetic test suite
+├── Dockerfile           # Non-root container image definition
+├── docker-compose.yml   # Production container orchestration
+└── dashboard.py         # Institutional real-time monitoring web app
+```
 
 ### Environment Setup
 
