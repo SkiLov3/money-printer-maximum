@@ -201,7 +201,7 @@ class Backtester:
         self._reset_state()
         frame = self._normalize_dataframe(df)
         indicators = prepared_indicators.copy() if prepared_indicators is not None else self.strategy._calculate_indicators(frame)
-        bars = indicators[["timestamp", "open", "high", "low", "close", "volume", "price"]].copy()
+        bars = pd.DataFrame(indicators[["timestamp", "open", "high", "low", "close", "volume", "price"]].copy())
 
         self.equity_history = [self.balance]
         self.equity_curve = []
@@ -314,7 +314,7 @@ class Backtester:
                 f"blocked_{routed.stage}",
                 signal["side"],
                 current_time,
-                float(row.get("close", row.get("price", 0))),
+                float(row.get("close", row.get("price", 0)) or 0.0),
                 routed.reason,
                 signal.get("metadata", {}),
             )
@@ -423,7 +423,7 @@ class Backtester:
             elif signal["side"] == "Sell" and target_price < entry_price:
                 tp_ticks = max(1, int(np.floor((entry_price - target_price) / self.tick_size)))
         elif target_r_multiple is not None and not pd.isna(target_r_multiple):
-            tp_ticks = max(1, int(round(sl_ticks * float(target_r_multiple))))
+            tp_ticks = max(1, round(sl_ticks * float(target_r_multiple)))
 
         trade = {
             "side": signal["side"],
@@ -597,7 +597,7 @@ class Backtester:
             return False
         column = str(metadata.get("profit_wave_slow_column", "smm_ema21"))
         wave = row.get(column)
-        close = float(row.get("close", row.get("price", 0.0)))
+        close = float(row.get("close", row.get("price", 0.0)) or 0.0)
         if metadata.get("smm_exit_on_dashboard_reversal"):
             trend_switch = int(row.get("smm_trend_switch", 0) or 0)
             mfi = float(row.get("smm_mfi", 50.0) or 50.0)
@@ -622,6 +622,16 @@ class Backtester:
         return gross_pnl - round_trip_commission
 
     def _record_trade(self, trade, exit_price, pnl, result, timestamp):
+        entry_price = float(trade["entry"])
+        mfe_price = float(trade.get("mfe_price", entry_price))
+        mae_price = float(trade.get("mae_price", entry_price))
+        if trade["side"] == "Buy":
+            mfe_ticks = max(0.0, (mfe_price - entry_price) / self.tick_size) if self.tick_size > 0 else 0.0
+            mae_ticks = max(0.0, (entry_price - mae_price) / self.tick_size) if self.tick_size > 0 else 0.0
+        else:
+            mfe_ticks = max(0.0, (entry_price - mfe_price) / self.tick_size) if self.tick_size > 0 else 0.0
+            mae_ticks = max(0.0, (mae_price - entry_price) / self.tick_size) if self.tick_size > 0 else 0.0
+        sl_ticks = max(1, int(trade.get("sl_ticks", 1) or 1))
         record = {
             "side": trade["side"],
             "entry": trade["entry"],
@@ -631,6 +641,12 @@ class Backtester:
             "time_open": trade["time_open"],
             "time_close": timestamp,
             "qty": trade["qty"],
+            "sl_ticks": int(trade.get("sl_ticks", 0) or 0),
+            "tp_ticks": int(trade.get("tp_ticks", 0) or 0),
+            "mfe_ticks": round(mfe_ticks, 2),
+            "mae_ticks": round(mae_ticks, 2),
+            "mfe_r": round(mfe_ticks / sl_ticks, 2),
+            "mae_r": round(mae_ticks / sl_ticks, 2),
             "strategy_name": trade.get("strategy_name", "unknown"),
             "metadata": trade.get("metadata", {}),
             "entry_screenshot": trade.get("entry_screenshot"),
@@ -639,8 +655,8 @@ class Backtester:
         self.balance += pnl
         try:
             self.last_signal_time = pd.to_datetime(timestamp).timestamp()
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            self.last_signal_time = None
         self._sync_risk_state()
         self.telemetry.record_trade_close(
             self.symbol,

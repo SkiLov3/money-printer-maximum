@@ -7,9 +7,9 @@ Verifies:
 - Fallback hypotheses when LLM is unavailable
 """
 import json
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -474,6 +474,87 @@ def test_apply_param_override_mirrors_asian_orb_and_symbol_params():
     mtf_params = cfg["strategies"]["strategies"][1]["params"]
     assert mtf_params["min_adx"] == 30.0
     assert mtf_params["symbol_params"]["MES"]["min_adx"] == 30.0
+
+
+def test_reclaim_ticks_tunable_and_mfe_mae_excursion_telemetry(temp_dir):
+    """Verifies fade_reclaim_ticks/asian_fade_reclaim_ticks whitelist and MFE/MAE telemetry extraction."""
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    from scripts.saturday_autonomous_optimizer import (
+        apply_param_override,
+        extract_recent_trades,
+        is_valid_candidate_param,
+        query_llm_hypotheses,
+    )
+    from src.persistence.database import DatabaseService
+
+    assert is_valid_candidate_param("orb_vwap", "fade_reclaim_ticks") is True
+    assert is_valid_candidate_param("orb_vwap", "asian_fade_reclaim_ticks") is True
+
+    cfg = {
+        "strategies": {
+            "strategies": [
+                {
+                    "name": "orb_vwap",
+                    "enabled": True,
+                    "params": {
+                        "opening_range_enabled": False,
+                        "asian_enabled": True,
+                        "fade_reclaim_ticks": 0,
+                        "asian_fade_reclaim_ticks": 0,
+                    },
+                }
+            ]
+        }
+    }
+    assert apply_param_override(cfg, "orb_vwap", "asian_fade_reclaim_ticks", 2) is True
+    orb_p = cfg["strategies"]["strategies"][0]["params"]
+    assert orb_p["asian_fade_reclaim_ticks"] == 2
+    assert orb_p["fade_reclaim_ticks"] == 2
+
+    db_file = temp_dir / "test_excursions.db"
+    db = DatabaseService({"enabled": True, "backend": "sqlite", "sqlite_path": str(db_file)})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.persist_trade_outcome(
+        trade_key="mfe-mae-1",  # gitleaks:allow
+        symbol="MCLZ6",
+        order_id="1001",
+        account_id="12345678",
+        session="ASIAN",
+        pnl=-50.0,
+        close_type="stop",
+        closed_at=now_iso,
+        outcome={
+            "closed_position": {"strategy_name": "orb_vwap", "side": "Sell", "qty": 1, "entry": 70.00, "sl_ticks": 20},
+            "mfe_ticks": 30.0,
+            "mae_ticks": 20.0,
+            "mfe_r": 1.5,
+            "mae_r": 1.0,
+        },
+    )
+    db.close()
+
+    trades = extract_recent_trades(db_file, days=7)
+    assert len(trades) == 1
+    captured_payload = {}
+
+    def _fake_call(model, sys_p, user_c, schema=None, timeout=180):
+        captured_payload["data"] = json.loads(user_c)
+        return {"analysis_summary": "ok", "identified_flaws": [], "hypotheses": []}
+
+    with (
+        patch("scripts.saturday_autonomous_optimizer.ping_ollama", return_value=True),
+        patch("scripts.saturday_autonomous_optimizer.call_llm_stage", side_effect=_fake_call),
+    ):
+        query_llm_hypotheses(trades)
+
+    loss_item = captured_payload["data"]["sample_losses"][0]
+    assert loss_item["mfe_ticks"] == 30.0
+    assert loss_item["mae_ticks"] == 20.0
+    assert loss_item["mfe_r"] == 1.5
+    assert loss_item["mae_r"] == 1.0
+
 
 
 

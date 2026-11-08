@@ -28,17 +28,18 @@ import sqlite3
 import sys
 import time
 import urllib.request
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-import zoneinfo
+
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.config.settings import load_stack_config, get_strategy_config
+from src.config.settings import get_strategy_config, load_stack_config
 from src.utils.backtester import Backtester
 
 logging.basicConfig(
@@ -76,12 +77,14 @@ TUNABLE_PARAMS: dict[str, tuple[str, ...]] = {
         "min_or_ticks",
         "max_or_ticks",
         "breakout_buffer_ticks",
+        "fade_reclaim_ticks",
         "asian_risk_reward",
         "asian_min_or_ticks",
         "asian_max_or_ticks",
         "asian_min_volume_ratio",
         "asian_stop_buffer_ticks",
         "asian_breakout_buffer_ticks",
+        "asian_fade_reclaim_ticks",
     ),
 }
 ALL_TUNABLE_PARAMS: list[str] = [p for params in TUNABLE_PARAMS.values() for p in params]
@@ -350,6 +353,7 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
                    COALESCE(c.selected_signal_json, '{}') AS selected_signal_json,
                    COALESCE(c.account_snapshot_json, '{}') AS account_snapshot_json,
                    COALESCE(c.route_context_json, '{}') AS route_context_json,
+                   COALESCE(o.outcome_json, '{}') AS outcome_json,
                    o.pnl,
                    o.close_type
             FROM trade_outcomes o
@@ -380,9 +384,18 @@ def query_llm_hypotheses(trades: list[dict[str, Any]], model: str = DEFAULT_MODE
         if raw_sig:
             try:
                 sig_meta = json.loads(raw_sig).get("metadata", {})
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 sig_meta = {}
-        sample_losses.append({
+        outcome_meta = {}
+        raw_out = t.get("outcome_json")
+        if raw_out:
+            try:
+                parsed_out = json.loads(raw_out)
+                if isinstance(parsed_out, dict):
+                    outcome_meta = parsed_out
+            except (ValueError, TypeError):
+                outcome_meta = {}
+        loss_entry = {
             "symbol": t.get("symbol"),
             "strategy": t.get("strategy_name"),
             "side": t.get("side"),
@@ -390,7 +403,14 @@ def query_llm_hypotheses(trades: list[dict[str, Any]], model: str = DEFAULT_MODE
             "close_type": t.get("close_type"),
             "session": t.get("session"),
             "signal_details": sig_meta,
-        })
+        }
+        for exc_key in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r"):
+            val = outcome_meta.get(exc_key)
+            if val is None and isinstance(outcome_meta.get("closed_position"), dict):
+                val = outcome_meta["closed_position"].get(exc_key)
+            if val is not None:
+                loss_entry[exc_key] = val
+        sample_losses.append(loss_entry)
 
     summary_data = {
         "total_trades": len(trades),
@@ -664,11 +684,9 @@ def evaluate_backtest_candidate(
     max_drawdown = 0.0
     for t in portfolio_trades:
         cum_pnl += t.get("pnl", 0)
-        if cum_pnl > peak_pnl:
-            peak_pnl = cum_pnl
+        peak_pnl = max(peak_pnl, cum_pnl)
         dd = peak_pnl - cum_pnl
-        if dd > max_drawdown:
-            max_drawdown = dd
+        max_drawdown = max(max_drawdown, dd)
 
     all_dates = sorted({str(t.get("time_open", ""))[:10] for t in portfolio_trades if t.get("time_open")})
     if len(all_dates) >= holdout_days:
