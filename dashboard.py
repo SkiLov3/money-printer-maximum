@@ -24,7 +24,7 @@ STATUS_FILE = Path("logs/bot_status.json")
 try:
     from src.version import VERSION
 except ImportError:
-    VERSION = "2.5.2"
+    VERSION = "2.5.3"
 PORT        = int(os.getenv("DASHBOARD_PORT", 8765))
 HOST        = os.getenv("DASHBOARD_HOST", "0.0.0.0")  # noqa: S104  # 0.0.0.0 = accessible remotely
 PASSWORD    = os.getenv("DASHBOARD_PASSWORD", "")       # empty = no auth (local dev)
