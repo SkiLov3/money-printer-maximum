@@ -1353,8 +1353,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"Unauthorized. Set DASHBOARD_PASSWORD env var.")
         return False
 
+    def _check_same_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        if host:
+            origin_netloc = urlparse(origin).netloc
+            if origin_netloc != host:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Cross-origin POST rejected"}).encode("utf-8"))
+                return False
+        return True
+
     def do_POST(self):
         if not self._require_auth():
+            return
+        if not self._check_same_origin():
             return
 
         if self.path == "/api/flatten":

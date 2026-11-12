@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import copy
 import fcntl
 import json
@@ -88,6 +89,32 @@ TUNABLE_PARAMS: dict[str, tuple[str, ...]] = {
     ),
 }
 ALL_TUNABLE_PARAMS: list[str] = [p for params in TUNABLE_PARAMS.values() for p in params]
+
+PARAM_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
+    "mtf_trend_scalper": {
+        "min_adx": (15.0, 45.0),
+        "sl_atr_mult": (1.0, 3.5),
+        "tp_atr_mult": (1.5, 6.0),
+        "min_stop_ticks": (8.0, 40.0),
+        "max_stop_ticks": (30.0, 120.0),
+        "skip_open_minutes": (0.0, 30.0),
+        "skip_close_minutes": (0.0, 30.0),
+    },
+    "orb_vwap": {
+        "risk_reward": (1.0, 4.0),
+        "min_or_ticks": (5.0, 40.0),
+        "max_or_ticks": (30.0, 200.0),
+        "breakout_buffer_ticks": (0.0, 10.0),
+        "fade_reclaim_ticks": (0.0, 10.0),
+        "asian_risk_reward": (1.0, 4.0),
+        "asian_min_or_ticks": (5.0, 40.0),
+        "asian_max_or_ticks": (30.0, 200.0),
+        "asian_min_volume_ratio": (0.0, 3.0),
+        "asian_stop_buffer_ticks": (0.0, 10.0),
+        "asian_breakout_buffer_ticks": (0.0, 10.0),
+        "asian_fade_reclaim_ticks": (0.0, 10.0),
+    },
+}
 
 _ollama_raw = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
 _ollama_base = _ollama_raw if _ollama_raw.startswith("http") else f"http://{_ollama_raw}"
@@ -368,6 +395,41 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
         con.close()
 
 
+def _format_trade_sample(t: dict[str, Any]) -> dict[str, Any]:
+    sig_meta = {}
+    raw_sig = t.get("selected_signal_json")
+    if raw_sig:
+        try:
+            sig_meta = json.loads(raw_sig).get("metadata", {})
+        except (ValueError, TypeError, AttributeError):
+            sig_meta = {}
+    outcome_meta = {}
+    raw_out = t.get("outcome_json")
+    if raw_out:
+        try:
+            parsed_out = json.loads(raw_out)
+            if isinstance(parsed_out, dict):
+                outcome_meta = parsed_out
+        except (ValueError, TypeError):
+            outcome_meta = {}
+    entry = {
+        "symbol": t.get("symbol"),
+        "strategy": t.get("strategy_name"),
+        "side": t.get("side"),
+        "pnl": t.get("pnl"),
+        "close_type": t.get("close_type"),
+        "session": t.get("session"),
+        "signal_details": sig_meta,
+    }
+    for exc_key in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r"):
+        val = outcome_meta.get(exc_key)
+        if val is None and isinstance(outcome_meta.get("closed_position"), dict):
+            val = outcome_meta["closed_position"].get(exc_key)
+        if val is not None:
+            entry[exc_key] = val
+    return entry
+
+
 def query_llm_hypotheses(trades: list[dict[str, Any]], model: str = DEFAULT_MODELS["diagnose"]) -> dict[str, Any]:
     """Stage 1: Asks local Qwen 3.5 (122B) to diagnose losing trades and propose parameter sweep hypotheses."""
     if not ping_ollama():
@@ -377,46 +439,15 @@ def query_llm_hypotheses(trades: list[dict[str, Any]], model: str = DEFAULT_MODE
     losses = [t for t in trades if t.get("pnl", 0) <= 0]
     wins = [t for t in trades if t.get("pnl", 0) > 0]
 
-    sample_losses = []
-    for t in losses[:15]:
-        sig_meta = {}
-        raw_sig = t.get("selected_signal_json")
-        if raw_sig:
-            try:
-                sig_meta = json.loads(raw_sig).get("metadata", {})
-            except (ValueError, TypeError, AttributeError):
-                sig_meta = {}
-        outcome_meta = {}
-        raw_out = t.get("outcome_json")
-        if raw_out:
-            try:
-                parsed_out = json.loads(raw_out)
-                if isinstance(parsed_out, dict):
-                    outcome_meta = parsed_out
-            except (ValueError, TypeError):
-                outcome_meta = {}
-        loss_entry = {
-            "symbol": t.get("symbol"),
-            "strategy": t.get("strategy_name"),
-            "side": t.get("side"),
-            "pnl": t.get("pnl"),
-            "close_type": t.get("close_type"),
-            "session": t.get("session"),
-            "signal_details": sig_meta,
-        }
-        for exc_key in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r"):
-            val = outcome_meta.get(exc_key)
-            if val is None and isinstance(outcome_meta.get("closed_position"), dict):
-                val = outcome_meta["closed_position"].get(exc_key)
-            if val is not None:
-                loss_entry[exc_key] = val
-        sample_losses.append(loss_entry)
+    sample_losses = [_format_trade_sample(t) for t in losses[:15]]
+    sample_wins = [_format_trade_sample(t) for t in wins[:10]]
 
     summary_data = {
         "total_trades": len(trades),
         "wins_count": len(wins),
         "losses_count": len(losses),
         "sample_losses": sample_losses,
+        "sample_wins": sample_wins,
     }
 
     system_prompt = (
@@ -501,6 +532,16 @@ def stage_codestral_certify(
             "code_signature_verified": False,
         }
 
+    if not is_valid_param_value(strat_name, param_name, param_val):
+        return {
+            "certified": False,
+            "strategy": strat_name,
+            "parameter": param_name,
+            "value": param_val,
+            "reason": f"Parameter value {param_val} for {strat_name}.{param_name} violates safety bounds.",
+            "code_signature_verified": False,
+        }
+
     if not ping_ollama():
         logger.warning("Ollama is not running. Using deterministic static AST certification.")
         return {
@@ -556,7 +597,41 @@ def stage_codestral_certify(
         }
 
 
-def get_fallback_hypotheses() -> dict[str, Any]:
+def get_fallback_hypotheses(base_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if base_config is None:
+        try:
+            base_config = load_stack_config(str(CONFIG_FILE))
+        except Exception:
+            base_config = None
+
+    base_adx = 25.0
+    base_sl = 1.5
+    if isinstance(base_config, dict):
+        for spec in (base_config.get("strategies", {}) or {}).get("strategies", []):
+            if isinstance(spec, dict) and spec.get("name") == "mtf_trend_scalper":
+                params = spec.get("params", {})
+                if isinstance(params, dict):
+                    sym_params = params.get("symbol_params", {})
+                    found_adx = False
+                    found_sl = False
+                    if isinstance(sym_params, dict):
+                        for sym_cfg in sym_params.values():
+                            if isinstance(sym_cfg, dict):
+                                if not found_adx and "min_adx" in sym_cfg:
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        base_adx = float(sym_cfg["min_adx"])
+                                        found_adx = True
+                                if not found_sl and "sl_atr_mult" in sym_cfg:
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        base_sl = float(sym_cfg["sl_atr_mult"])
+                                        found_sl = True
+                    if not found_adx and "min_adx" in params:
+                        with contextlib.suppress(ValueError, TypeError):
+                            base_adx = float(params["min_adx"])
+                    if not found_sl and "sl_atr_mult" in params:
+                        with contextlib.suppress(ValueError, TypeError):
+                            base_sl = float(params["sl_atr_mult"])
+
     return {
         "analysis_summary": "Deterministic grid sweep around current production baseline.",
         "identified_flaws": ["Routine weekly parameter neighborhood calibration."],
@@ -564,13 +639,22 @@ def get_fallback_hypotheses() -> dict[str, Any]:
             {
                 "strategy": "mtf_trend_scalper",
                 "parameter": "min_adx",
-                "test_values": [30.0, 33.0, 35.0, 38.0],
+                "test_values": [
+                    round(base_adx - 5.0, 1),
+                    round(base_adx - 2.0, 1),
+                    round(base_adx, 1),
+                    round(base_adx + 3.0, 1),
+                ],
                 "rationale": "Test ADX momentum threshold sensitivity across market volatility shifts.",
             },
             {
                 "strategy": "mtf_trend_scalper",
                 "parameter": "sl_atr_mult",
-                "test_values": [1.3, 1.5, 1.8],
+                "test_values": [
+                    round(max(1.0, base_sl - 0.2), 2),
+                    round(base_sl, 2),
+                    round(base_sl + 0.3, 2),
+                ],
                 "rationale": "Calibrate stop-loss ATR breathing room.",
             },
         ],
@@ -600,6 +684,49 @@ _ORB_ASIAN_PARAM_MIRRORS: dict[str, str] = {
 
 
 _ORB_ASIAN_REVERSE_MIRRORS: dict[str, str] = {v: k for k, v in _ORB_ASIAN_PARAM_MIRRORS.items()}
+
+
+def is_valid_param_value(strategy: str | None, param: str | None, value: Any) -> bool:
+    """Checks whether a parameter value satisfies safety bounds."""
+    if isinstance(value, bool):
+        return False
+    if not strategy or not param:
+        return False
+
+    if param == "allowed_entry_hours_et":
+        if isinstance(value, list):
+            if not value:
+                return False
+            return all(
+                isinstance(h, int) and not isinstance(h, bool) and 0 <= h <= 23
+                for h in value
+            )
+        if isinstance(value, (int, float)):
+            return 0 <= value <= 23
+        return False
+
+    strat_bounds = PARAM_BOUNDS.get(strategy)
+    if not strat_bounds:
+        return False
+
+    bounds = strat_bounds.get(param)
+    if bounds is None:
+        mirror = _ORB_ASIAN_PARAM_MIRRORS.get(param)
+        if mirror:
+            bounds = strat_bounds.get(mirror)
+        else:
+            reverse_mirror = _ORB_ASIAN_REVERSE_MIRRORS.get(param)
+            if reverse_mirror:
+                bounds = strat_bounds.get(reverse_mirror)
+
+    if bounds is None:
+        return False
+
+    if not isinstance(value, (int, float)):
+        return False
+
+    min_val, max_val = bounds
+    return min_val <= float(value) <= max_val
 
 
 def apply_param_override(cfg: dict[str, Any], strategy: str, param: str, value: Any) -> bool:
@@ -651,6 +778,34 @@ def _run_single_symbol(sym: str, path: Path, strat_cfg: dict[str, Any]) -> list[
     return trades
 
 
+def _get_dataset_cutoff_date(holdout_days: int) -> str | None:
+    """Inspects CONTINUOUS_DATA and returns (max_date - timedelta(days=holdout_days)).strftime('%Y-%m-%d')."""
+    max_dt: datetime | None = None
+    for raw_path in CONTINUOUS_DATA.values():
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size == 0:
+                    continue
+                f.seek(max(0, size - 4096), os.SEEK_SET)
+                lines = f.read().decode("utf-8", errors="replace").strip().splitlines()
+                if not lines:
+                    continue
+                ts_str = lines[-1].split(",")[0].strip()
+                dt = datetime.fromisoformat(ts_str[:10])
+                if max_dt is None or dt > max_dt:
+                    max_dt = dt
+        except Exception as exc:
+            logger.debug(f"Could not extract max date from {path}: {exc}")
+    if max_dt is None:
+        return None
+    return (max_dt - timedelta(days=holdout_days)).strftime("%Y-%m-%d")
+
+
 def evaluate_backtest_candidate(
     config_dict: dict[str, Any], holdout_days: int = 21
 ) -> dict[str, Any]:
@@ -658,7 +813,7 @@ def evaluate_backtest_candidate(
     strat_cfg = get_strategy_config(config_dict)
     portfolio_trades = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CONTINUOUS_DATA)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(CONTINUOUS_DATA))) as executor:
         futures = [
             executor.submit(_run_single_symbol, sym, path, strat_cfg)
             for sym, path in CONTINUOUS_DATA.items()
@@ -689,13 +844,21 @@ def evaluate_backtest_candidate(
         max_drawdown = max(max_drawdown, dd)
 
     all_dates = sorted({str(t.get("time_open", ""))[:10] for t in portfolio_trades if t.get("time_open")})
-    if len(all_dates) >= holdout_days:
-        cutoff_date = all_dates[-holdout_days]
+    cutoff_date = _get_dataset_cutoff_date(holdout_days)
+    if cutoff_date is None and all_dates:
+        cutoff_date = (datetime.fromisoformat(all_dates[-1]) - timedelta(days=holdout_days)).strftime("%Y-%m-%d")
+
+    if cutoff_date is not None:
         holdout = [t for t in portfolio_trades if str(t.get("time_open", ""))[:10] >= cutoff_date]
         insample = [t for t in portfolio_trades if str(t.get("time_open", ""))[:10] < cutoff_date]
+    else:
+        holdout = []
+        insample = portfolio_trades
+
+    if holdout:
         holdout_pnl = sum(t.get("pnl", 0) for t in holdout)
         insample_pnl = sum(t.get("pnl", 0) for t in insample)
-        holdout_wr = sum(1 for t in holdout if t.get("pnl", 0) > 0) / (len(holdout) or 1)
+        holdout_wr = sum(1 for t in holdout if t.get("pnl", 0) > 0) / len(holdout)
     else:
         holdout_pnl = 0.0
         insample_pnl = total_pnl
@@ -1006,6 +1169,12 @@ def _run_optimizer_locked(
                         val = [int(val)]
                     elif not isinstance(val, list):
                         continue
+
+                if not is_valid_param_value(strat_name, param_name, val):
+                    logger.warning(
+                        f"Rejecting candidate value {strat_name}.{param_name}={val}: outside safety bounds."
+                    )
+                    continue
 
                 candidate_id = f"{strat_name}.{param_name}={val}"
                 if any(r.get("candidate_id") == candidate_id for r in eval_results):

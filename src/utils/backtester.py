@@ -396,6 +396,12 @@ class Backtester:
                     if existing["side"] == "Buy"
                     else entry_price + (self.slippage_ticks * self.tick_size)
                 )
+                if existing["side"] == "Buy":
+                    existing["mfe_price"] = max(float(existing.get("mfe_price", existing["entry"])), exit_price)
+                    existing["mae_price"] = min(float(existing.get("mae_price", existing["entry"])), exit_price)
+                else:
+                    existing["mfe_price"] = min(float(existing.get("mfe_price", existing["entry"])), exit_price)
+                    existing["mae_price"] = max(float(existing.get("mae_price", existing["entry"])), exit_price)
                 pnl = self._calculate_final_pnl(existing, exit_price)
                 timestamp_str = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
                 self._record_trade(existing, exit_price, pnl, "REVERSAL", timestamp_str)

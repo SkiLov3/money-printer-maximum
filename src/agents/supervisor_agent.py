@@ -153,27 +153,32 @@ class SupervisorAgent:
         try:
             with open("logs/bot_status.json") as f:
                 last_status = json.load(f)
-                if str(last_status.get("account_id")) == str(self.account_id):
-                    self._pnl_history = last_status.get("pnl_history", [])
-                    recent = last_status.get("session_trades", last_status.get("recent_trades", []))
-                    session_start_utc = self.get_current_session_start_utc()
+                if isinstance(last_status, dict):
+                    if str(last_status.get("account_id")) == str(self.account_id):
+                        self._pnl_history = last_status.get("pnl_history", [])
+                        recent = last_status.get("session_trades", last_status.get("recent_trades", []))
+                        if not isinstance(recent, list):
+                            recent = []
+                        session_start_utc = self.get_current_session_start_utc()
 
-                    valid_session_trades = []
-                    for t in reversed(recent):
-                        ts_str = t.get("timestamp")
-                        if ts_str:
-                            try:
-                                trade_dt = datetime.fromisoformat(ts_str)
-                                if trade_dt >= session_start_utc:
-                                    valid_session_trades.append(t)
-                            except (ValueError, TypeError):
+                        valid_session_trades = []
+                        for t in reversed(recent):
+                            if not isinstance(t, dict):
                                 continue
-                    self._recent_trades = valid_session_trades
-                else:
-                    self.logger.info(f"Account ID changed from '{last_status.get('account_id')}' to '{self.account_id}'. Clearing old session history.")
-                    self._pnl_history = []
-                    self._recent_trades = []
-        except (OSError, ValueError, TypeError) as e:
+                            ts_str = t.get("timestamp")
+                            if ts_str:
+                                try:
+                                    trade_dt = datetime.fromisoformat(ts_str)
+                                    if trade_dt >= session_start_utc:
+                                        valid_session_trades.append(t)
+                                except (ValueError, TypeError):
+                                    continue
+                        self._recent_trades = valid_session_trades
+                    else:
+                        self.logger.info(f"Account ID changed from '{last_status.get('account_id')}' to '{self.account_id}'. Clearing old session history.")
+                        self._pnl_history = []
+                        self._recent_trades = []
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as e:
             self.logger.debug(f"Could not load initial bot_status.json: {e}")
 
         # Restore recent/session trades from persistent database
@@ -1850,6 +1855,13 @@ class SupervisorAgent:
             if internal_qty == qty and (not internal_positions or internal_side == side):
                 if internal_positions and avg_price > 0 and abs(float(internal_positions[0].get("entry", 0.0)) - avg_price) > 1e-6:
                     internal_positions[0]["entry"] = avg_price
+                    side_norm = str(internal_positions[0].get("side") or "Buy").strip().lower()
+                    if side_norm in ("buy", "long", "0"):
+                        internal_positions[0]["mfe_price"] = max(self._safe_float(internal_positions[0].get("mfe_price"), avg_price), avg_price)
+                        internal_positions[0]["mae_price"] = min(self._safe_float(internal_positions[0].get("mae_price"), avg_price), avg_price)
+                    else:
+                        internal_positions[0]["mfe_price"] = min(self._safe_float(internal_positions[0].get("mfe_price"), avg_price), avg_price)
+                        internal_positions[0]["mae_price"] = max(self._safe_float(internal_positions[0].get("mae_price"), avg_price), avg_price)
                     with self.risk_agent._lock:
                         if self.risk_agent.open_positions.get(symbol):
                             self.risk_agent.open_positions[symbol][0]["entry"] = Decimal(str(avg_price))
@@ -2033,6 +2045,7 @@ class SupervisorAgent:
                 now_utc = datetime.now(timezone.utc)
                 trade_session = (closed or {}).get("session") or get_trade_session((closed or {}).get("time") or now_utc)
                 self._persist_closed_trade_outcome(symbol=symbol, closed=closed, pnl=_pnl, order_type=order_type, session=trade_session)
+                excursions = self._compute_position_excursions(symbol, closed)
                 self._recent_trades.append({
                     "symbol": symbol,
                     "trade_key": closed.get("trade_key"),
@@ -2040,9 +2053,19 @@ class SupervisorAgent:
                     "pnl": round(_pnl, 2),
                     "type": order_type,
                     "side": closed.get("side", ""),
+                    "entry": closed.get("entry"),
+                    "qty": closed.get("qty"),
+                    "strategy_name": closed.get("strategy_name", "unknown"),
+                    "sl_ticks": closed.get("sl_ticks"),
+                    "tp_ticks": closed.get("tp_ticks"),
+                    "mfe_price": closed.get("mfe_price"),
+                    "mae_price": closed.get("mae_price"),
+                    "reason": closed.get("reason", ""),
+                    "metadata": closed.get("metadata", {}),
                     "time": now_utc.strftime("%m/%d %H:%M"),
                     "timestamp": now_utc.isoformat(),
                     "session": trade_session,
+                    **excursions,
                 })
                 self._recent_trades = self._recent_trades[-20:]
                 self._feed_live_outcome_to_discovery(
@@ -2087,10 +2110,24 @@ class SupervisorAgent:
                     pos["mae_price"] = max(mae_prev, high_p, close_p)
 
     def _compute_position_excursions(self, symbol: str, pos: dict) -> dict[str, float]:
+        if "mfe_ticks" in pos and "mae_ticks" in pos and pos.get("mfe_ticks") is not None:
+            result = {
+                "mfe_price": self._safe_float(pos.get("mfe_price")),
+                "mae_price": self._safe_float(pos.get("mae_price")),
+                "mfe_ticks": self._safe_float(pos.get("mfe_ticks")),
+                "mae_ticks": self._safe_float(pos.get("mae_ticks")),
+            }
+            if "mfe_r" in pos and pos.get("mfe_r") is not None:
+                result["mfe_r"] = self._safe_float(pos.get("mfe_r"))
+            if "mae_r" in pos and pos.get("mae_r") is not None:
+                result["mae_r"] = self._safe_float(pos.get("mae_r"))
+            return result
         entry = self._safe_float(pos.get("entry"))
         if entry <= 0:
             return {}
-        tick_size = self._safe_float(self.risk_agent.get_tick_size(symbol), default=0.25)
+        tick_fn = getattr(getattr(self, "risk_agent", None), "get_tick_size", None)
+        raw_tick = tick_fn(symbol) if callable(tick_fn) else 0.25
+        tick_size = self._safe_float(raw_tick, default=0.25)
         if tick_size <= 0:
             tick_size = 0.25
         mfe_price = self._safe_float(pos.get("mfe_price"), default=entry)
@@ -2125,6 +2162,14 @@ class SupervisorAgent:
             trade_session = session or closed.get("session") or get_trade_session(closed.get("time") or closed_at)
             closed_copy = dict(closed)
             excursions = self._compute_position_excursions(symbol, closed_copy)
+            if not excursions:
+                for k in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r", "mfe_price", "mae_price"):
+                    if k in closed_copy and closed_copy[k] is not None:
+                        excursions[k] = closed_copy[k]
+            else:
+                for k in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r", "mfe_price", "mae_price"):
+                    if k not in excursions and k in closed_copy and closed_copy[k] is not None:
+                        excursions[k] = closed_copy[k]
             closed_copy.update(excursions)
             self.database.persist_trade_outcome(
                 trade_key=trade_key,
@@ -2476,6 +2521,12 @@ class SupervisorAgent:
                                 "trade_key": preserved_meta.get("trade_key") if same_side else None,
                                 "session": preserved_meta.get("session") if same_side else None,
                                 "account_id": str(getattr(self, "account_id", None)) if getattr(self, "account_id", None) else None,
+                                "sl_ticks": preserved_meta.get("sl_ticks") if same_side else None,
+                                "tp_ticks": preserved_meta.get("tp_ticks") if same_side else None,
+                                "mfe_price": preserved_meta.get("mfe_price", bp["entry"]) if same_side else bp["entry"],
+                                "mae_price": preserved_meta.get("mae_price", bp["entry"]) if same_side else bp["entry"],
+                                "reason": preserved_meta.get("reason", "") if same_side else "",
+                                "metadata": preserved_meta.get("metadata", {}) if same_side else {},
                             }
                             self.active_positions[sym].append(pos_entry)
                             self.risk_agent.record_position_open(sym, bp["side"], bp["qty"], bp["entry"])
@@ -2530,6 +2581,12 @@ class SupervisorAgent:
                             "trade_key": preserved_meta.get("trade_key") if same_side else None,
                             "session": preserved_meta.get("session") if same_side else None,
                             "account_id": str(getattr(self, "account_id", None)) if getattr(self, "account_id", None) else None,
+                            "sl_ticks": preserved_meta.get("sl_ticks") if same_side else None,
+                            "tp_ticks": preserved_meta.get("tp_ticks") if same_side else None,
+                            "mfe_price": preserved_meta.get("mfe_price", bp["entry"]) if same_side else bp["entry"],
+                            "mae_price": preserved_meta.get("mae_price", bp["entry"]) if same_side else bp["entry"],
+                            "reason": preserved_meta.get("reason", "") if same_side else "",
+                            "metadata": preserved_meta.get("metadata", {}) if same_side else {},
                         }
                         self.active_positions[sym].append(pos_entry)
                         self.risk_agent.record_position_open(sym, bp["side"], bp["qty"], bp["entry"])
@@ -2934,6 +2991,8 @@ class SupervisorAgent:
                 if self._balance_persistence_path.exists():
                     try:
                         opening_data = json.loads(self._balance_persistence_path.read_text())
+                        if not isinstance(opening_data, dict):
+                            opening_data = {}
                     except (OSError, ValueError, TypeError):
                         opening_data = {}
 
