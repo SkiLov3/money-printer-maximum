@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -218,6 +219,10 @@ class SupervisorAgent:
         self._latest_broker_positions_snapshot = {}
         self._latest_broker_positions_at = 0.0
         self._last_stall_reconnect_at = 0.0
+        self._reconnect_backoff_secs = 10.0
+        self._next_reconnect_at = 0.0
+        self._order_filled_qty: dict[str, int] = {}
+        self._db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="swarm-db")
         self._last_bracket_guard_at = 0.0
         self._stop_placement_in_flight: dict[str, float] = {}
         self._started_at = time.time()
@@ -667,14 +672,23 @@ class SupervisorAgent:
                     await self._smart_sleep(sleep_secs)
                     continue
 
-                # Ensure streams are active during market hours
+                # Ensure streams are active during market hours (exponential backoff prevents auth/429 storms)
                 if not self.client.is_connected or not self.client.user_is_connected:
-                    self.logger.warning("Market session active but SignalR stream(s) disconnected. Re-initializing...")
-                    await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
-                    self.client.subscribe_market_data(self.official_symbols)
-                    await self._smart_sleep(3)
-                    await self._refresh_recent_bars(bar_count=60)
-                    self._eod_triggered = False
+                    if now_ts >= getattr(self, "_next_reconnect_at", 0.0):
+                        backoff = float(getattr(self, "_reconnect_backoff_secs", 10.0) or 10.0)
+                        self.logger.warning(
+                            f"Market session active but SignalR stream(s) disconnected. Re-initializing (next backoff={backoff:.0f}s)..."
+                        )
+                        await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=False))
+                        self.client.subscribe_market_data(self.official_symbols)
+                        await self._smart_sleep(3)
+                        await self._refresh_recent_bars(bar_count=60)
+                        self._eod_triggered = False
+                        self._next_reconnect_at = time.time() + backoff
+                        self._reconnect_backoff_secs = min(60.0, backoff * 2.0)
+                else:
+                    self._reconnect_backoff_secs = 10.0
+                    self._next_reconnect_at = 0.0
 
                 if now_ts - self._last_account_poll >= 30:
                     # Heartbeat Sync: Every 30s we poll account status.
@@ -963,6 +977,7 @@ class SupervisorAgent:
 
         # 1. Fetch AUTHORITATIVE state from broker REST (never rely on internal state here)
         broker_active_syms = set()
+        broker_flattened_syms = set()
         fetch_failed = False
         try:
             broker_positions = await self.loop.run_in_executor(None, self.client.get_positions)
@@ -1006,8 +1021,10 @@ class SupervisorAgent:
                         self._close_in_flight_since.pop(sym, None)
                         continue
 
-                    # Flatten succeeded (or at least order was sent)
+                    # Flatten order accepted — keep internal position under _close_in_flight
+                    # so GatewayUserPosition (netSize=0) + GatewayUserTrade attribute realized PnL cleanly.
                     broker_active_syms.discard(sym)
+                    broker_flattened_syms.add(sym)
 
                     # Give the broker time to process before checking next position
                     await asyncio.sleep(2)
@@ -1046,10 +1063,11 @@ class SupervisorAgent:
             return
 
         async with self._lock:
-            # We don't just clear everything anymore; we check broker truth at start of loop.
-            # But for safety, ensure RiskAgent is aware of the current state.
+            # Clear internal tracking ONLY for symbols already flat on the broker.
+            # Symbols with a flatten order in flight remain guarded until GatewayUserPosition
+            # (netSize=0) + GatewayUserTrade attribute their realized PnL (with 30s auto-expiry fallback).
             for sym in self.official_symbols:
-                if sym not in broker_active_syms:
+                if sym not in broker_active_syms and sym not in broker_flattened_syms:
                     self.active_positions[sym] = []
                     with self.risk_agent._lock:
                         self.risk_agent.open_positions[sym] = []
@@ -1144,20 +1162,25 @@ class SupervisorAgent:
                     sym = self._resolve_symbol_from_payload(data)
                     if sym:
                         self._pending_fill_pnl[sym] = self._pending_fill_pnl.get(sym, 0.0) + pnl_f
-                        # Retroactive race check: If sym is flat internally and the most recent trade
+                        # Retroactive race check: If sym is flat internally and a recent trade
                         # closed within the last 5 seconds with 0.0 PnL, update that trade now so
                         # pnl is not stranded in _pending_fill_pnl.
                         if not self.active_positions.get(sym) and self._recent_trades:
-                            last_trade = self._recent_trades[-1]
-                            if (
-                                last_trade.get("symbol") == sym
-                                and float(last_trade.get("pnl", 0.0)) == 0.0
-                                and time.time() - self._recently_closed.get(sym, 0) < 5.0
-                            ):
+                            fill_oid = str(data.get("orderId") or "")
+                            matched_trade = None
+                            for cand in reversed(self._recent_trades[-5:]):
+                                if cand.get("symbol") != sym or float(cand.get("pnl", 0.0)) != 0.0:
+                                    continue
+                                if fill_oid and cand.get("order_id") and str(cand.get("order_id")) == fill_oid:
+                                    matched_trade = cand
+                                    break
+                                if matched_trade is None:
+                                    matched_trade = cand
+                            if matched_trade is not None and time.time() - self._recently_closed.get(sym, 0) < 5.0:
                                 self.logger.info(
                                     f"[USER-HUB FILL] Retroactively attributing ${pnl_f:.2f} to recently closed {sym} trade."
                                 )
-                                last_trade["pnl"] = round(pnl_f, 2)
+                                matched_trade["pnl"] = round(pnl_f, 2)
                                 self._pending_fill_pnl.pop(sym, None)
                                 self._last_trade_won[sym] = pnl_f > 0
                                 if pnl_f > 0:
@@ -1169,13 +1192,13 @@ class SupervisorAgent:
                                     self.risk_agent.record_trade_result(pnl_f, symbol=sym)
                                 except Exception as e:
                                     self.logger.debug(f"record_trade_result skipped for {sym}: {e}")
-                                if last_trade.get("trade_key"):
+                                if matched_trade.get("trade_key"):
                                     self._persist_closed_trade_outcome(
                                         symbol=sym,
-                                        closed=last_trade,
+                                        closed=matched_trade,
                                         pnl=pnl_f,
-                                        order_type=last_trade.get("type", "retroactive_fill"),
-                                        session=last_trade.get("session"),
+                                        order_type=matched_trade.get("type", "retroactive_fill"),
+                                        session=matched_trade.get("session"),
                                     )
 
                     prev_fills_pnl = self._session_pnl_from_fills
@@ -1298,8 +1321,10 @@ class SupervisorAgent:
                     # strategies can apply their fresh-close re-entry gate.
                     if close_type == "sl":
                         self._notify_strategy_stop_exit(symbol)
-                    # FIX: Clear close-in-flight flag now that broker has confirmed flat.
-                    self._close_in_flight.pop(symbol, None)
+                    # Keep close-in-flight active until _handle_position_close_update acquires
+                    # self._lock and drains active_positions (prevents 250ms TOCTOU stop race).
+                    self._close_in_flight[symbol] = True
+                    self._close_in_flight_since[symbol] = time.time()
                     # Signal to Case B that a drain is already queued for this symbol
                     # so it does not schedule a second _handle_position_close_update.
                     self._drain_queued[symbol] = True
@@ -1312,10 +1337,23 @@ class SupervisorAgent:
                 asyncio.ensure_future(self._handle_position_open_update(symbol, side, qty, fill_price))
                 return
 
-            # Case B: Standard Order Fill
-            if order_status in ("filled", "completed", "executed", "2", "3"): # Handle numeric status too (2=filled, 3=completed)
-                qty_raw = data.get("filledQty") or data.get("size") or data.get("fillVolume") or 0
-                qty = int(abs(self._safe_float(qty_raw)))
+            # Case B: Standard Order Fill (including partial fills status=7)
+            if order_status in ("filled", "completed", "executed", "partially_filled", "2", "3", "7"):
+                cum_raw = data.get("fillVolume") or data.get("filledQty") or data.get("size") or 0
+                cum_qty = int(abs(self._safe_float(cum_raw)))
+                oid_raw = data.get("id") or data.get("orderId")
+                if oid_raw is not None:
+                    if not hasattr(self, "_order_filled_qty"):
+                        self._order_filled_qty = {}
+                    oid_key = str(oid_raw)
+                    prev_filled = int(self._order_filled_qty.get(oid_key, 0))
+                    qty = max(0, cum_qty - prev_filled)
+                    self._order_filled_qty[oid_key] = max(prev_filled, cum_qty)
+                    if len(self._order_filled_qty) > 1000:
+                        for old_k in list(self._order_filled_qty.keys())[:500]:
+                            self._order_filled_qty.pop(old_k, None)
+                else:
+                    qty = cum_qty
 
                 if qty > 0:
                     self.logger.info(f"[LEDGER FILL] {symbol} {order_status.upper()} {qty}x @ {fill_price}")
@@ -1673,25 +1711,31 @@ class SupervisorAgent:
             )
             from src.utils.session_utils import get_trade_session
             session_name = get_trade_session(opened_at_dt)
-            self.database.persist_trade_context(
-                trade_key=trade_key,
-                symbol=sym,
-                strategy_name=trade_intent.get("strategy_name", "unknown"),
-                side=trade_intent.get("side", ""),
-                quantity=int(quantity),
-                order_id=order_id,
-                entry_price=float(execution_price or 0.0),
-                opened_at=opened_at_dt.isoformat(),
-                session=session_name,
-                strategy_params=self._strategy_params_snapshot(sym),
-                selected_signal=dict(trade_intent),
-                candidates=[dict(c) for c in candidates],
-                blender_metadata=dict(blender_metadata),
-                route_context=dict(route_context or {}),
-                discovery_context=dict(discovery_decision or {}),
-                account_snapshot=self._account_risk_snapshot(),
-                chart_artifacts=chart_artifacts,
-            )
+            ctx_kwargs = {
+                "trade_key": trade_key,
+                "symbol": sym,
+                "strategy_name": trade_intent.get("strategy_name", "unknown"),
+                "side": trade_intent.get("side", ""),
+                "quantity": int(quantity),
+                "order_id": order_id,
+                "entry_price": float(execution_price or 0.0),
+                "opened_at": opened_at_dt.isoformat(),
+                "session": session_name,
+                "strategy_params": self._strategy_params_snapshot(sym),
+                "selected_signal": dict(trade_intent),
+                "candidates": [dict(c) for c in candidates],
+                "blender_metadata": dict(blender_metadata),
+                "route_context": dict(route_context or {}),
+                "discovery_context": dict(discovery_decision or {}),
+                "account_snapshot": self._account_risk_snapshot(),
+                "chart_artifacts": chart_artifacts,
+            }
+            loop = getattr(self, "loop", None)
+            db_exec = getattr(self, "_db_executor", None)
+            if loop is not None and hasattr(loop, "is_running") and loop.is_running() and db_exec is not None:
+                loop.run_in_executor(db_exec, lambda kw=ctx_kwargs: self.database.persist_trade_context(**kw))
+            else:
+                self.database.persist_trade_context(**ctx_kwargs)
         except Exception as exc:
             self.logger.warning("[LEARNING CAPTURE] trade context NOT persisted for %s: %s", sym, exc, exc_info=True)
 
@@ -2218,16 +2262,16 @@ class SupervisorAgent:
                     if k not in excursions and k in closed_copy and closed_copy[k] is not None:
                         excursions[k] = closed_copy[k]
             closed_copy.update(excursions)
-            self.database.persist_trade_outcome(
-                trade_key=trade_key,
-                symbol=symbol,
-                order_id=closed.get("order_id"),
-                account_id=account_id,
-                session=trade_session,
-                pnl=float(pnl),
-                close_type=str(order_type or ""),
-                closed_at=closed_at,
-                outcome={
+            outcome_kwargs = {
+                "trade_key": trade_key,
+                "symbol": symbol,
+                "order_id": closed.get("order_id"),
+                "account_id": account_id,
+                "session": trade_session,
+                "pnl": float(pnl),
+                "close_type": str(order_type or ""),
+                "closed_at": closed_at,
+                "outcome": {
                     "account_id": account_id,
                     "closed_position": closed_copy,
                     "session": trade_session,
@@ -2236,7 +2280,13 @@ class SupervisorAgent:
                     "closed_at": closed_at,
                     **excursions,
                 },
-            )
+            }
+            loop = getattr(self, "loop", None)
+            db_exec = getattr(self, "_db_executor", None)
+            if loop is not None and hasattr(loop, "is_running") and loop.is_running() and db_exec is not None:
+                loop.run_in_executor(db_exec, lambda kw=outcome_kwargs: self.database.persist_trade_outcome(**kw))
+            else:
+                self.database.persist_trade_outcome(**outcome_kwargs)
         except Exception as exc:
             self.logger.warning("[LEARNING OUTCOME] trade outcome NOT persisted for %s: %s", symbol, exc, exc_info=True)
 
@@ -2408,6 +2458,17 @@ class SupervisorAgent:
                 f"[BRACKET GUARD] ⚠️ UNPROTECTED POSITION DETECTED! {symbol} {side} {qty}x @ {entry_p} has NO active stop-loss! "
                 f"Placing emergency protective stop: {stop_side} {qty}x Stop @ {stop_price} ({effective_sl_ticks} ticks)..."
             )
+
+            exec_agent = getattr(self, "execution_agent", None)
+            exec_mode = getattr(exec_agent, "mode", None) or os.getenv("MODE", "simulation").strip().lower()
+            if exec_mode == "live" and os.getenv("ACTUAL_LIVE_TRADING", "false").strip().lower() != "true":
+                async with self._lock:
+                    if hasattr(self, "_stop_placement_in_flight"):
+                        self._stop_placement_in_flight.pop(symbol, None)
+                self.logger.critical(
+                    f"[BRACKET GUARD] LIVE MODE BLOCK: ACTUAL_LIVE_TRADING is not 'true' — blocking emergency stop for {symbol}."
+                )
+                return False
 
             res = await self.loop.run_in_executor(
                 None,
@@ -2652,7 +2713,7 @@ class SupervisorAgent:
         import re
         def _norm(s: str) -> str:
             clean = str(s).lstrip("/").upper().strip()
-            m_con = re.search(r'\b([A-Z]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', clean)
+            m_con = re.search(r'\b([A-Z0-9]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', clean)
             if m_con:
                 root, my = m_con.group(1), m_con.group(2)
                 if root.endswith("E") and len(root) > 3:
@@ -2974,10 +3035,15 @@ class SupervisorAgent:
         tz_ny = ZoneInfo('America/New_York')
         now_et = datetime.now(timezone.utc).astimezone(tz_ny)
         current_time_et = now_et.time()
-
+        wd = now_et.weekday()
         asian_start_time = dt_time(18, 0)
 
-        if current_time_et >= asian_start_time:
+        # During weekend closure (Fri >= 17:00, all Saturday, Sunday < 18:00),
+        # return Thursday 18:00 ET (start of Friday's trading session).
+        if (wd == 4 and current_time_et >= dt_time(17, 0)) or wd == 5 or (wd == 6 and current_time_et < asian_start_time):
+            days_back_to_thu = (wd - 3) % 7
+            session_start_et = (now_et - timedelta(days=days_back_to_thu)).replace(hour=18, minute=0, second=0, microsecond=0)
+        elif current_time_et >= asian_start_time:
             session_start_et = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
         else:
             session_start_et = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)

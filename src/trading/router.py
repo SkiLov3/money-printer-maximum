@@ -67,6 +67,8 @@ class TradeRouter:
 
         routed_intent = dict(trade_intent)
         routed_intent["quantity"] = quantity
+        if routed_intent.get("entry_price") is None and route_context.get("current_price"):
+            routed_intent["entry_price"] = route_context.get("current_price")
         self.risk_agent.set_pending(trade_intent["symbol"], True)
         try:
             result = self.execution_agent.execute_trade(routed_intent)

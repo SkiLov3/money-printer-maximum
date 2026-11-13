@@ -26,6 +26,45 @@ class ExecutionAgent:
             self.logger.info(f"USE_ORDER_BRACKETS is false. Stripping brackets from {symbol} order.")
             sl_ticks = None
             tp_ticks = None
+        else:
+            metadata = trade_intent.get("metadata") or {}
+            if isinstance(metadata, dict) and (
+                metadata.get("stop_price") is not None
+                or metadata.get("target_price") is not None
+                or metadata.get("target_r_multiple") is not None
+            ):
+                import math
+                entry_ref = trade_intent.get("entry_price")
+                meta_fn = getattr(self.client, "get_contract_meta", None)
+                c_meta = meta_fn(symbol) if callable(meta_fn) else None
+                tick_sz = float(c_meta.get("tickSize") or 0.0) if isinstance(c_meta, dict) else 0.0
+                if entry_ref is not None and tick_sz > 0:
+                    try:
+                        ep = float(entry_ref)
+                        if math.isfinite(ep) and ep > 0:
+                            sp = metadata.get("stop_price")
+                            if sp is not None:
+                                sp_f = float(sp)
+                                if math.isfinite(sp_f):
+                                    if side == "Buy" and sp_f < ep:
+                                        sl_ticks = max(1, int(math.ceil((ep - sp_f) / tick_sz)))
+                                    elif side == "Sell" and sp_f > ep:
+                                        sl_ticks = max(1, int(math.ceil((sp_f - ep) / tick_sz)))
+                            tp = metadata.get("target_price")
+                            tr_mult = metadata.get("target_r_multiple")
+                            if tp is not None:
+                                tp_f = float(tp)
+                                if math.isfinite(tp_f):
+                                    if side == "Buy" and tp_f > ep:
+                                        tp_ticks = max(1, int(math.floor((tp_f - ep) / tick_sz)))
+                                    elif side == "Sell" and tp_f < ep:
+                                        tp_ticks = max(1, int(math.floor((ep - tp_f) / tick_sz)))
+                            elif tr_mult is not None and sl_ticks:
+                                tr_f = float(tr_mult)
+                                if math.isfinite(tr_f) and tr_f > 0:
+                                    tp_ticks = max(1, round(int(sl_ticks) * tr_f))
+                    except (ValueError, TypeError) as meta_err:
+                        self.logger.debug(f"Metadata bracket override skipped for {symbol}: {meta_err}")
 
         # Log that we are sending a simulated order and INTERCEPT it
         if self.mode != "live":

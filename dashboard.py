@@ -26,7 +26,7 @@ try:
 except ImportError:
     VERSION = "2.5.3"
 PORT        = int(os.getenv("DASHBOARD_PORT", 8765))
-HOST        = os.getenv("DASHBOARD_HOST", "0.0.0.0")  # noqa: S104  # 0.0.0.0 = accessible remotely
+HOST        = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PASSWORD    = os.getenv("DASHBOARD_PASSWORD", "")       # empty = no auth (local dev)
 
 HTML = """<!DOCTYPE html>
@@ -1355,17 +1355,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _check_same_origin(self) -> bool:
         origin = self.headers.get("Origin")
-        if not origin:
-            return True
         host = self.headers.get("Host", "")
-        if host:
-            origin_netloc = urlparse(origin).netloc
-            if origin_netloc != host:
+        if origin:
+            if not host or urlparse(origin).netloc != host:
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "Cross-origin POST rejected"}).encode("utf-8"))
                 return False
+            return True
+        referer = self.headers.get("Referer")
+        if referer and host and urlparse(referer).netloc != host:
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Cross-origin POST rejected"}).encode("utf-8"))
+            return False
         return True
 
     def do_POST(self):

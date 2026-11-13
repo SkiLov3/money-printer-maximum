@@ -266,6 +266,7 @@ class TestExecutionAgentHardening:
 class TestSignalREnvelopeHandling:
     def test_multi_shape_envelope_extraction(self):
         client = ProjectXClient()
+        client.account_id = 12345
         received = []
         client._on_user_event = lambda event_type, payload: received.append((event_type, payload))
 

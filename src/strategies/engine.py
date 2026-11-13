@@ -336,7 +336,20 @@ class StrategyEngine:
 
         signal = None
         last_idx = len(indicators) - 1
-        for idx in range(len(indicators)):
+        start_idx = 0
+        if self._last_processed_timestamp is not None and "timestamp" in indicators.columns:
+            ts_index = pd.Index(indicators["timestamp"])
+            if ts_index.is_monotonic_increasing:
+                start_idx = int(ts_index.searchsorted(self._last_processed_timestamp, side="right"))
+                if start_idx > last_idx:
+                    return None
+        elif last_idx > 0:
+            # Cold analyze() call without prior prime(): prime historical bars silently
+            # so stateful strategies build state without emitting warmup telemetry.
+            self.prime(bars, indicators, last_idx - 1)
+            start_idx = last_idx
+
+        for idx in range(start_idx, last_idx + 1):
             res, _ = self.evaluate_index(bars, indicators, idx)
             if idx == last_idx:
                 signal = res

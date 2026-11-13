@@ -252,8 +252,8 @@ class Backtester:
             self.equity_curve.append({"timestamp": current_time_str, "equity": equity_value})
             self.screenshot_capture.on_bar_end()
             if self.routing_mode == "optimizer_fast" and not self.active_trades and pending_signal is None:
-                risk_hit, _ = self.risk_agent.is_risk_limit_hit()
-                if risk_hit:
+                risk_hit, risk_reason = self.risk_agent.is_risk_limit_hit()
+                if risk_hit and "Maximum Loss Limit" in str(risk_reason):
                     break
 
         results = self._get_results()
@@ -515,11 +515,12 @@ class Backtester:
             is_tp_hit = (trade["side"] == "Buy" and high >= trade["tp_price"]) or (trade["side"] == "Sell" and low <= trade["tp_price"])
 
             if is_sl_hit:
-                exit_price = (
-                    trade["sl_price"] - (self.slippage_ticks * self.tick_size)
-                    if trade["side"] == "Buy"
-                    else trade["sl_price"] + (self.slippage_ticks * self.tick_size)
-                )
+                if trade["side"] == "Buy":
+                    fill_base = min(open_p, trade["sl_price"])
+                    exit_price = fill_base - (self.slippage_ticks * self.tick_size)
+                else:
+                    fill_base = max(open_p, trade["sl_price"])
+                    exit_price = fill_base + (self.slippage_ticks * self.tick_size)
                 pnl = self._calculate_final_pnl(trade, exit_price)
                 result = "BE" if trade["be_triggered"] else "SL"
                 is_profitable_trail = (trade["side"] == "Buy" and exit_price > trade["entry"]) or (trade["side"] == "Sell" and exit_price < trade["entry"])
@@ -565,7 +566,11 @@ class Backtester:
                         trade["be_triggered"] = True
                         trade["sl_price"] = trade["entry"]
                 else:
-                    exit_price = open_p
+                    exit_price = (
+                        open_p - (self.slippage_ticks * self.tick_size)
+                        if trade["side"] == "Buy"
+                        else open_p + (self.slippage_ticks * self.tick_size)
+                    )
                     pnl = self._calculate_final_pnl(trade, exit_price)
                     self._record_trade(trade, exit_price, pnl, "PRO-EXIT", timestamp_str)
                     self.risk_agent.record_trade_result(pnl, symbol=self.symbol)
@@ -651,6 +656,7 @@ class Backtester:
             "tp_ticks": int(trade.get("tp_ticks", 0) or 0),
             "mfe_ticks": round(mfe_ticks, 2),
             "mae_ticks": round(mae_ticks, 2),
+            "mae_dollars": round(mae_ticks * float(getattr(self, "tick_value", 0.0) or 0.0) * int(trade.get("qty", 1) or 1), 2),
             "mfe_r": round(mfe_ticks / sl_ticks, 2),
             "mae_r": round(mae_ticks / sl_ticks, 2),
             "strategy_name": trade.get("strategy_name", "unknown"),
@@ -662,7 +668,7 @@ class Backtester:
         try:
             self.last_signal_time = pd.to_datetime(timestamp).timestamp()
         except (ValueError, TypeError):
-            self.last_signal_time = None
+            self.last_signal_time = 0.0
         self._sync_risk_state()
         self.telemetry.record_trade_close(
             self.symbol,

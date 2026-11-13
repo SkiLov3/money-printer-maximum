@@ -21,9 +21,11 @@ import concurrent.futures
 import contextlib
 import copy
 import fcntl
+import gc
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -357,15 +359,18 @@ def call_llm_stage(
 
 
 def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
-    """Extracts recent trades from swarm.db in read-only mode."""
+    """Extracts recent trades from swarm.db via an atomic snapshot backup."""
     if not db_path.exists():
         logger.error(f"Database not found: {db_path}")
         return []
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    src_con = sqlite3.connect(str(db_path), timeout=10.0)
+    src_con.execute("PRAGMA busy_timeout=10000")
+    con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     try:
+        src_con.backup(con)
         rows = con.execute(
             """
             SELECT o.id,
@@ -393,6 +398,7 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
     finally:
         con.close()
+        src_con.close()
 
 
 def _format_trade_sample(t: dict[str, Any]) -> dict[str, Any]:
@@ -838,10 +844,12 @@ def evaluate_backtest_candidate(
     peak_pnl = 0.0
     max_drawdown = 0.0
     for t in portfolio_trades:
-        cum_pnl += t.get("pnl", 0)
+        mae_dollars = max(0.0, float(t.get("mae_dollars", 0.0) or 0.0))
+        trough_pnl = cum_pnl - mae_dollars
+        max_drawdown = max(max_drawdown, peak_pnl - trough_pnl)
+        cum_pnl += float(t.get("pnl", 0.0) or 0.0)
         peak_pnl = max(peak_pnl, cum_pnl)
-        dd = peak_pnl - cum_pnl
-        max_drawdown = max(max_drawdown, dd)
+        max_drawdown = max(max_drawdown, peak_pnl - cum_pnl)
 
     all_dates = sorted({str(t.get("time_open", ""))[:10] for t in portfolio_trades if t.get("time_open")})
     cutoff_date = _get_dataset_cutoff_date(holdout_days)
@@ -855,14 +863,30 @@ def evaluate_backtest_candidate(
         holdout = []
         insample = portfolio_trades
 
+    insample_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample)
+    is_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) > 0)
+    is_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) < 0))
+    insample_pf = is_wins / is_losses if is_losses > 0 else (float("inf") if is_wins > 0 else 0.0)
+    is_cum = 0.0
+    is_peak = 0.0
+    insample_mdd = 0.0
+    for t in insample:
+        mae_d = max(0.0, float(t.get("mae_dollars", 0.0) or 0.0))
+        insample_mdd = max(insample_mdd, is_peak - (is_cum - mae_d))
+        is_cum += float(t.get("pnl", 0.0) or 0.0)
+        is_peak = max(is_peak, is_cum)
+        insample_mdd = max(insample_mdd, is_peak - is_cum)
+
     if holdout:
-        holdout_pnl = sum(t.get("pnl", 0) for t in holdout)
-        insample_pnl = sum(t.get("pnl", 0) for t in insample)
-        holdout_wr = sum(1 for t in holdout if t.get("pnl", 0) > 0) / len(holdout)
+        holdout_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout)
+        holdout_wr = sum(1 for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0) / len(holdout)
+        ho_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0)
+        ho_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) < 0))
+        holdout_pf = ho_wins / ho_losses if ho_losses > 0 else (float("inf") if ho_wins > 0 else 0.0)
     else:
         holdout_pnl = 0.0
-        insample_pnl = total_pnl
         holdout_wr = 0.0
+        holdout_pf = 0.0
         holdout = []
 
     return {
@@ -871,11 +895,28 @@ def evaluate_backtest_candidate(
         "total_pnl": round(total_pnl, 2),
         "profit_factor": round(pf, 3),
         "max_drawdown": round(max_drawdown, 2),
+        "in_sample_trades": len(insample),
         "in_sample_pnl": round(insample_pnl, 2),
+        "in_sample_pf": round(insample_pf, 3),
+        "in_sample_max_drawdown": round(insample_mdd, 2),
         "holdout_pnl": round(holdout_pnl, 2),
+        "holdout_pf": round(holdout_pf, 3),
         "holdout_trades": len(holdout),
         "holdout_win_rate": round(holdout_wr, 4),
     }
+
+
+class _QuotedTimeSafeDumper(yaml.SafeDumper):
+    """Ensure HH:MM / HH:MM:SS strings remain quoted so YAML 1.1 never parses them as sexagesimal ints."""
+
+
+def _repr_time_str(dumper: yaml.SafeDumper, data: str):
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", data):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_QuotedTimeSafeDumper.add_representer(str, _repr_time_str)
 
 
 def stage_atomic_config_update(
@@ -910,7 +951,7 @@ def stage_atomic_config_update(
     tmp_file = CONFIG_FILE.with_suffix(".tmp")
     try:
         with open(tmp_file, "w", encoding="utf-8") as f:
-            yaml.safe_dump(new_config, f, sort_keys=False)
+            yaml.dump(new_config, f, Dumper=_QuotedTimeSafeDumper, sort_keys=False)
     except Exception as e:
         logger.error(f"Failed to write temporary config file: {e}")
         return False
@@ -1187,6 +1228,7 @@ def _run_optimizer_locked(
                     continue
 
                 cand_metrics = evaluate_backtest_candidate(test_cfg)
+                gc.collect()
                 if all(cand_metrics.get(k) == base_metrics.get(k) for k in ("total_trades", "total_pnl", "profit_factor", "max_drawdown")):
                     logger.warning(f"Candidate {candidate_id} produced results identical to baseline (no effect).")
                     cand_metrics["no_effect"] = True
@@ -1212,10 +1254,14 @@ def _run_optimizer_locked(
         mgr.update_phase("VALIDATION_GATE")
 
     # Phase 6: Validation Gate & Selection
+    # Strictly separate In-Sample ranking from Out-of-Sample (21-day holdout) confirmation
+    # to eliminate holdout snooping / data leakage.
     if mgr.state["phase"] == "VALIDATION_GATE":
-        logger.info("Evaluating candidates against strict validation gates...")
-        best_candidate = None
-        base_pf = base_metrics.get("profit_factor", 1.25)
+        logger.info("Evaluating candidates against strict in-sample ranking + holdout confirmation gates...")
+        best_in_sample = None
+        base_is_pf = base_metrics.get("in_sample_pf", base_metrics.get("profit_factor", 1.25))
+        base_is_pnl = base_metrics.get("in_sample_pnl", base_metrics.get("total_pnl", 0.0))
+        base_is_mdd = base_metrics.get("in_sample_max_drawdown", base_metrics.get("max_drawdown", 1000.0))
         base_holdout = base_metrics.get("holdout_pnl", 0.0)
         base_mdd = base_metrics.get("max_drawdown", 1000.0)
         base_trades = int(base_metrics.get("total_trades", 0) or 0)
@@ -1226,33 +1272,48 @@ def _run_optimizer_locked(
             if no_effect_rate > 0.5:
                 logger.warning(f"High no_effect rate ({no_effect_rate:.1%}) in candidate sweep — review parameter mappings.")
 
+        max_allowed_mdd = max(base_mdd * 1.15, 600.0)
+        max_allowed_is_mdd = max(base_is_mdd * 1.15, 600.0)
         for cand in eval_results:
-            pf = cand.get("profit_factor", 0.0)
-            holdout_pnl = cand.get("holdout_pnl", 0.0)
+            is_pf = cand.get("in_sample_pf", cand.get("profit_factor", 0.0))
+            is_pnl = cand.get("in_sample_pnl", cand.get("total_pnl", 0.0))
+            is_mdd = cand.get("in_sample_max_drawdown", cand.get("max_drawdown", float("inf")))
             total_trades = cand.get("total_trades", 0)
             cand_mdd = cand.get("max_drawdown", float("inf"))
 
-            max_allowed_mdd = max(base_mdd * 1.15, 600.0)
             if (
                 not cand.get("no_effect")
-                and pf >= 1.25
-                and pf >= base_pf
-                and holdout_pnl > 0
-                and holdout_pnl >= base_holdout
+                and is_pf >= 1.25
+                and is_pf >= base_is_pf
+                and is_pnl > 0
                 and total_trades >= min_required_trades
+                and is_mdd <= max_allowed_is_mdd
                 and cand_mdd <= max_allowed_mdd
-                and (pf, holdout_pnl, -cand_mdd) > (base_pf, base_holdout, -base_mdd)
+                and (is_pf, is_pnl, -is_mdd) > (base_is_pf, base_is_pnl, -base_is_mdd)
             ):
-                if best_candidate is None or (
-                    (pf, holdout_pnl, total_trades, -cand_mdd)
+                if best_in_sample is None or (
+                    (is_pf, is_pnl, total_trades, -is_mdd)
                     > (
-                        best_candidate["profit_factor"],
-                        best_candidate.get("holdout_pnl", 0.0),
-                        best_candidate.get("total_trades", 0),
-                        -best_candidate.get("max_drawdown", float("inf")),
+                        best_in_sample.get("in_sample_pf", best_in_sample.get("profit_factor", 0.0)),
+                        best_in_sample.get("in_sample_pnl", best_in_sample.get("total_pnl", 0.0)),
+                        best_in_sample.get("total_trades", 0),
+                        -best_in_sample.get("in_sample_max_drawdown", best_in_sample.get("max_drawdown", float("inf"))),
                     )
                 ):
-                    best_candidate = cand
+                    best_in_sample = cand
+
+        best_candidate = None
+        if best_in_sample is not None:
+            ho_pnl = best_in_sample.get("holdout_pnl", 0.0)
+            ho_pf = best_in_sample.get("holdout_pf", best_in_sample.get("profit_factor", 0.0))
+            ho_floor = (base_holdout * 0.85) if base_holdout > 0 else base_holdout
+            if ho_pnl > 0 and ho_pf >= 1.05 and ho_pnl >= ho_floor:
+                best_candidate = best_in_sample
+            else:
+                logger.info(
+                    f"Top in-sample finalist {best_in_sample.get('candidate_id')} failed 21-day OOS holdout gate "
+                    f"(Holdout PnL=${ho_pnl:+.2f} < floor ${ho_floor:+.2f}, PF={ho_pf:.2f}); retaining baseline."
+                )
 
         if best_candidate:
             logger.info(

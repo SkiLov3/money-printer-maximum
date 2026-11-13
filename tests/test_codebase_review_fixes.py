@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
 from email.message import Message
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+import yaml
+
 from dashboard import Handler
 from scripts.saturday_autonomous_optimizer import (
+    _QuotedTimeSafeDumper,
     evaluate_backtest_candidate,
     get_fallback_hypotheses,
     is_valid_param_value,
 )
+from src.agents.execution_agent import ExecutionAgent
 from src.agents.supervisor_agent import SupervisorAgent
+from src.api.projectx_client import ProjectXClient
+from src.strategies.engine import StrategyEngine
+from src.telemetry.store import TelemetryStore
 from src.utils.backtester import Backtester
 
 
@@ -221,3 +231,205 @@ def test_backtester_reversal_updates_excursions():
     assert res_type == "REVERSAL"
     # MFE price must be updated to 5010.0
     assert closed_trade["mfe_price"] == 5010.0
+
+
+def test_projectx_client_hardening():
+    client = ProjectXClient()
+    client.account_id = 12345
+    client.symbol_to_id_cache["MESZ6"] = "CON.F.US.MES.Z26"
+
+    # 1. STOP_TYPES accepts stoploss string variants
+    orders = [{"id": 77, "contractId": "CON.F.US.MES.Z26", "side": 1, "type": "stoploss", "status": 1}]
+    with patch.object(client, "get_orders", return_value=orders):
+        assert client.has_working_stop_order("MESZ6", "Buy") is True
+
+    # 2. _build_refreshed_ws_url preserves &id=<connectionId>
+    refreshed = client._build_refreshed_ws_url(
+        "wss://rtc.topstepx.com/hubs/market",
+        "NEW_JWT",
+        "wss://rtc.topstepx.com/hubs/market?access_token=OLD&id=conn-abc-123",
+    )
+    assert "access_token=NEW_JWT" in refreshed
+    assert "id=conn-abc-123" in refreshed
+
+    # 3. _make_user_event_handler rejects cross-account envelopes even when inner dict lacks accountId
+    events = []
+    client._on_user_event = lambda et, p: events.append((et, p))
+    handler = client._make_user_event_handler("GatewayUserOrder")
+    handler([99999, 1, {"id": 501, "status": 2}])
+    assert events == []
+    handler([12345, 1, {"id": 502, "status": 2}])
+    assert len(events) == 1
+    assert events[0][1]["id"] == 502
+
+
+def test_supervisor_protective_stop_respects_actual_live_switch():
+    async def _run():
+        with patch("src.agents.supervisor_agent.DatabaseService"):
+            sup = SupervisorAgent(["MCL"], "12345")
+        sup.loop = asyncio.get_running_loop()
+        sup.execution_agent.mode = "live"
+        with (
+            patch.dict(os.environ, {"MODE": "live", "ACTUAL_LIVE_TRADING": "false"}),
+            patch.object(sup.client, "has_working_stop_order", return_value=False),
+            patch.object(sup.client, "place_order") as mock_place,
+        ):
+            res = await sup._ensure_protective_stop_for_position("MCLZ6", "Buy", 1, 88.5)
+            assert res is False
+            mock_place.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_supervisor_close_in_flight_retained_until_drain_and_partial_fills():
+    async def _run():
+        with patch("src.agents.supervisor_agent.DatabaseService"):
+            sup = SupervisorAgent(["MCL"], "12345")
+        sup.loop = asyncio.get_running_loop()
+        sup.client.cancel_open_orders_for_symbol = MagicMock(return_value=0)
+        sup.active_positions["MCLZ6"] = [{"side": "Buy", "qty": 3, "entry": 88.5, "time": 1000.0}]
+
+        # 1. netSize=0 sets _close_in_flight synchronously before drain coroutine executes
+        sup.on_order_update({"contractId": "MCLZ6", "netSize": 0})
+        assert sup._close_in_flight.get("MCLZ6") is True
+        await asyncio.sleep(0.35)
+        assert sup._close_in_flight.get("MCLZ6") is None
+        assert sup.active_positions.get("MCLZ6") == []
+
+        # 2. Partial fills (status 7) track cumulative fillVolume delta without double-counting
+        sup.active_positions["MCLZ6"] = [{"side": "Buy", "qty": 3, "entry": 88.5, "time": 1000.0}]
+        sup.on_order_update({"id": 9001, "contractId": "MCLZ6", "status": 7, "type": 1, "side": 1, "fillVolume": 1, "profitAndLoss": -10.0})
+        await asyncio.sleep(0.05)
+        assert sum(p["qty"] for p in sup.active_positions["MCLZ6"]) == 2
+        sup.on_order_update({"id": 9001, "contractId": "MCLZ6", "status": 2, "type": 1, "side": 1, "fillVolume": 3, "profitAndLoss": -20.0})
+        await asyncio.sleep(0.05)
+        assert sup.active_positions.get("MCLZ6") == []
+
+    asyncio.run(_run())
+
+
+def test_strategy_engine_incremental_analyze_and_silent_priming():
+    telemetry = TelemetryStore(enabled=True)
+    eng = StrategyEngine("MESZ6", 1, {"sl": 40, "tp": 80, "tick_size": 0.25}, telemetry=telemetry, config={"strategies": []})
+    call_indices = []
+
+    class _MockStrat:
+        name = "mock_strat"
+        priority = 100
+        enabled = True
+        is_priming = False
+
+        def on_bar(self, index, bars, indicators):
+            call_indices.append((index, self.is_priming))
+            return None
+
+        def get_snapshot(self, index, bars, indicators):
+            return {"status": "ok"}
+
+        def reset(self):
+            pass
+
+    eng.strategies = [_MockStrat()]  # type: ignore[list-item]
+    df = pd.DataFrame(
+        [
+            {"timestamp": f"2026-11-10T10:{i:02d}:00Z", "open": 5000.0, "high": 5001.0, "low": 4999.0, "close": 5000.5, "volume": 10}
+            for i in range(5)
+        ]
+    )
+    eng.analyze(df)
+    # Bars 0..3 primed with is_priming=True, bar 4 evaluated live
+    assert call_indices[:4] == [(0, True), (1, True), (2, True), (3, True)]
+    assert call_indices[4] == (4, False)
+
+    # Append 1 new bar -> only index 5 should be evaluated (no 0..4 loop!)
+    call_indices.clear()
+    df2 = pd.concat(
+        [
+            df,
+            pd.DataFrame([{"timestamp": "2026-11-10T10:05:00Z", "open": 5000.5, "high": 5002.0, "low": 5000.0, "close": 5001.5, "volume": 12}]),
+        ],
+        ignore_index=True,
+    )
+    eng.analyze(df2)
+    assert call_indices == [(5, False)]
+
+
+def test_backtester_gap_open_stop_fill_and_execution_metadata_parity():
+    # 1. Gap open past SL fills at open_p - slippage
+    bt: Any = Backtester.__new__(Backtester)
+    bt.tick_size = 0.25
+    bt.tick_value = 1.25
+    bt.slippage_ticks = 1
+    bt.commission_per_contract = 0.0
+    bt.symbol = "MES"
+    bt.routing_mode = "optimizer_fast"
+    bt.daily_profit_lock = 0.0
+    bt.news_agent = MagicMock()
+    bt.risk_agent = MagicMock()
+    bt.telemetry = MagicMock()
+    bt.balance = 50000.0
+    bt.trades = []
+    bt.active_trades = [
+        {
+            "side": "Buy",
+            "entry": 5000.0,
+            "sl_price": 4995.0,
+            "tp_price": 5020.0,
+            "qty": 1,
+            "sl_ticks": 20,
+            "tp_ticks": 80,
+            "trail_mult": 0.0,
+            "trail_trigger_ticks": 999,
+            "be_triggered": False,
+            "be_trigger_ticks": 999,
+            "mfe_price": 5000.0,
+            "mae_price": 5000.0,
+            "time_open": "2026-11-01T10:00:00Z",
+            "metadata": {},
+        }
+    ]
+    bt._sync_risk_state = MagicMock()
+    bt._update_active_trades(pd.Series({"open": 4990.0, "high": 4992.0, "low": 4989.0, "close": 4991.0, "timestamp": "2026-11-01T10:01:00Z"}))
+    assert len(bt.trades) == 1
+    assert bt.trades[0]["exit"] == 4989.75
+
+    # 2. ExecutionAgent computes dynamic metadata brackets identically to Backtester
+    mock_client = MagicMock()
+    mock_client.get_contract_meta.return_value = {"tickSize": 0.25}
+    mock_client.place_order.return_value = {"success": True, "orderId": 123}
+    with patch.dict(os.environ, {"MODE": "live", "ACTUAL_LIVE_TRADING": "true", "USE_ORDER_BRACKETS": "true"}):
+        ea = ExecutionAgent(mock_client)
+        ea.execute_trade(
+            {
+                "symbol": "MESZ6",
+                "side": "Buy",
+                "quantity": 1,
+                "entry_price": 5000.0,
+                "sl_ticks": 40,
+                "tp_ticks": 80,
+                "metadata": {"stop_price": 4997.5, "target_price": 5005.0},
+            }
+        )
+    assert mock_client.place_order.call_args.kwargs["sl_ticks"] == 10
+    assert mock_client.place_order.call_args.kwargs["tp_ticks"] == 20
+
+
+def test_optimizer_yaml_time_quoting_and_dashboard_referer_csrf():
+    dumped = yaml.dump({"opening_range_start_et": "09:30", "trade_window_end_et": "14:00"}, Dumper=_QuotedTimeSafeDumper, sort_keys=False)
+    reloaded = yaml.safe_load(dumped)
+    assert reloaded["opening_range_start_et"] == "09:30"
+    assert reloaded["trade_window_end_et"] == "14:00"
+    assert isinstance(reloaded["trade_window_end_et"], str)
+
+    handler: Any = Handler.__new__(Handler)
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    handler.wfile = MagicMock()
+    # Origin with missing Host must be rejected
+    handler.headers = _build_headers({"Origin": "http://localhost:8765"})
+    assert not handler._check_same_origin()
+    # Cross-origin Referer without Origin must be rejected
+    handler.headers = _build_headers({"Host": "localhost:8765", "Referer": "http://evil.com/attack.html"})
+    assert not handler._check_same_origin()
+

@@ -144,6 +144,7 @@ class TestSignalRStreamingAndReconnection:
 
     def test_user_event_handler_supports_batch_list_with_action_int(self):
         client = ProjectXClient()
+        client.account_id = 12345
         events = []
         client._on_user_event = lambda event_type, payload: events.append((event_type, payload))
 

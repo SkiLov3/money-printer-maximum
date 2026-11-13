@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -140,17 +141,32 @@ class ProjectXClient:
         import threading
         self.auth_lock = threading.Lock()
         self._reconnect_lock = threading.Lock()
+        self._symbol_cache_lock = threading.RLock()
         self._last_reconnect_attempt = 0.0
+
+    @staticmethod
+    def _build_refreshed_ws_url(base_url: str, access_token: str, existing_url: str | None) -> str:
+        from urllib.parse import parse_qs, urlparse
+        url = f"{base_url}?access_token={access_token}"
+        if existing_url:
+            try:
+                qs = parse_qs(urlparse(str(existing_url)).query)
+                conn_ids = qs.get("id")
+                if conn_ids and conn_ids[0]:
+                    url = f"{url}&id={conn_ids[0]}"
+            except Exception:
+                pass
+        return url
 
     def _update_connection_urls(self):
         """Synchronize the fresh JWT into active SignalR hub connection URLs and headers."""
         if not self.access_token:
             return
-        market_url = f"{self.hub_url}?access_token={self.access_token}"
-        user_url = f"{self.user_hub_url}?access_token={self.access_token}"
         auth_header = f"Bearer {self.access_token}"
 
         if self.connection:
+            existing_mkt = getattr(getattr(self.connection, "transport", None), "url", None) or getattr(self.connection, "url", None)
+            market_url = self._build_refreshed_ws_url(self.hub_url, self.access_token, existing_mkt)
             self.connection.url = market_url
             if hasattr(self.connection, "headers") and isinstance(self.connection.headers, dict):
                 self.connection.headers["Authorization"] = auth_header
@@ -160,6 +176,8 @@ class ProjectXClient:
                     self.connection.transport.headers["Authorization"] = auth_header
 
         if self.user_connection:
+            existing_usr = getattr(getattr(self.user_connection, "transport", None), "url", None) or getattr(self.user_connection, "url", None)
+            user_url = self._build_refreshed_ws_url(self.user_hub_url, self.access_token, existing_usr)
             self.user_connection.url = user_url
             if hasattr(self.user_connection, "headers") and isinstance(self.user_connection.headers, dict):
                 self.user_connection.headers["Authorization"] = auth_header
@@ -454,7 +472,16 @@ class ProjectXClient:
             "working", "open", "pending_new", "pending_bracket",
             "partially_filled", "code_1", "code_6", "code_7", "code_8",
         }
-        STOP_TYPES = {"stop", "trailing_stop", "code_4", "code_5"}
+        STOP_TYPES = {
+            "stop",
+            "trailing_stop",
+            "stoploss",
+            "stop_loss",
+            "stop_limit",
+            "stoplimit",
+            "code_4",
+            "code_5",
+        }
 
         for o in active_orders:
             oid = o.get("id")
@@ -756,47 +783,49 @@ class ProjectXClient:
         if not contract_id:
             return ""
         cid_str = str(contract_id)
-        if hasattr(self, "contract_id_to_symbol"):
-            if contract_id in self.contract_id_to_symbol:
-                return self.contract_id_to_symbol[contract_id]
-            if cid_str in self.contract_id_to_symbol:
-                return self.contract_id_to_symbol[cid_str]
+        cache_lock = getattr(self, "_symbol_cache_lock", None)
+        with cache_lock if cache_lock is not None else contextlib.nullcontext():
+            if hasattr(self, "contract_id_to_symbol"):
+                if contract_id in self.contract_id_to_symbol:
+                    return self.contract_id_to_symbol[contract_id]
+                if cid_str in self.contract_id_to_symbol:
+                    return self.contract_id_to_symbol[cid_str]
 
-        candidates = [k for k, v in self.symbol_to_id_cache.items() if str(v) == cid_str and not k.startswith("/")]
-        if not candidates:
-            # Check if contract_id itself is a Topstep contract specifier: e.g. CON.F.US.MES.Z26
+            candidates = [k for k, v in list(self.symbol_to_id_cache.items()) if str(v) == cid_str and not k.startswith("/")]
+            if not candidates:
+                # Check if contract_id itself is a Topstep contract specifier: e.g. CON.F.US.MES.Z26
+                import re
+                m = re.search(r'\b([A-Z0-9]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', cid_str)
+                if m:
+                    root, my = m.group(1), m.group(2)
+                    if root.endswith("E") and len(root) > 3:
+                        root = root[:-1]
+                    if len(my) == 3:  # e.g. Z26 -> Z6
+                        resolved = f"{root}{my[0]}{my[-1]}"
+                    else:
+                        resolved = f"{root}{my}"
+                    if hasattr(self, "contract_id_to_symbol"):
+                        self.contract_id_to_symbol[contract_id] = resolved
+                        self.contract_id_to_symbol[cid_str] = resolved
+                    return resolved
+                return cid_str
+
             import re
-            m = re.search(r'\b([A-Z]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', cid_str)
-            if m:
-                root, my = m.group(1), m.group(2)
-                if root.endswith("E") and len(root) > 3:
-                    root = root[:-1]
-                if len(my) == 3:  # e.g. Z26 -> Z6
-                    resolved = f"{root}{my[0]}{my[-1]}"
-                else:
-                    resolved = f"{root}{my}"
+            # Look for contract codes with month code and 1 or 2 digit year (e.g. MESZ6, MESZ26)
+            specific = [c for c in candidates if re.search(r'[FGHJKMNQUVXZ]\d{1,2}$', c)]
+            if specific:
+                # Prefer 1-digit year shorthand if present (standard convention used across the bot)
+                one_digit = [c for c in specific if re.search(r'[FGHJKMNQUVXZ]\d$', c)]
+                best = one_digit[0] if one_digit else specific[0]
                 if hasattr(self, "contract_id_to_symbol"):
-                    self.contract_id_to_symbol[contract_id] = resolved
-                    self.contract_id_to_symbol[cid_str] = resolved
-                return resolved
-            return cid_str
-
-        import re
-        # Look for contract codes with month code and 1 or 2 digit year (e.g. MESZ6, MESZ26)
-        specific = [c for c in candidates if re.search(r'[FGHJKMNQUVXZ]\d{1,2}$', c)]
-        if specific:
-            # Prefer 1-digit year shorthand if present (standard convention used across the bot)
-            one_digit = [c for c in specific if re.search(r'[FGHJKMNQUVXZ]\d$', c)]
-            best = one_digit[0] if one_digit else specific[0]
+                    self.contract_id_to_symbol[contract_id] = best
+                    self.contract_id_to_symbol[cid_str] = best
+                return best
+            best = candidates[0]
             if hasattr(self, "contract_id_to_symbol"):
                 self.contract_id_to_symbol[contract_id] = best
                 self.contract_id_to_symbol[cid_str] = best
             return best
-        best = candidates[0]
-        if hasattr(self, "contract_id_to_symbol"):
-            self.contract_id_to_symbol[contract_id] = best
-            self.contract_id_to_symbol[cid_str] = best
-        return best
 
     def _handle_message(self, message):
         if self.on_message_callback:
@@ -1062,10 +1091,19 @@ class ProjectXClient:
                     self.logger.warning(f"User-hub {event_name}: unparseable payload {message!r}")
                     return
 
+                if (
+                    envelope_account_id is not None
+                    and self.account_id is not None
+                    and int(envelope_account_id) != int(self.account_id)
+                ):
+                    return
+
                 for p in payloads:
                     if isinstance(p.get("data"), dict) and "id" not in p and "accountId" not in p:
                         p = p["data"]
                     p_acc_id = p.get("accountId") if event_name != "GatewayUserAccount" else p.get("id")
+                    if p_acc_id is None:
+                        p_acc_id = envelope_account_id
                     if p_acc_id is not None and self.account_id is not None:
                         try:
                             if int(p_acc_id) != int(self.account_id):
@@ -1152,8 +1190,8 @@ class ProjectXClient:
                     checker = getattr(transport, "connection_checker", None)
                     if checker and getattr(checker, "running", False):
                         checker.stop()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.debug("Ignoring connection_checker stop failure: %s", exc)
                 self.user_is_connected = False
 
     def reconnect_all_streams(self, force=True):
@@ -1175,11 +1213,13 @@ class ProjectXClient:
             self.start_user_streaming(force=True)
 
             # Ensure active_subscriptions is populated with all known trading contracts
-            for sym in list(self.contract_id_to_symbol.values()):
-                self.active_subscriptions.add(sym)
-            for sym in list(self.symbol_to_id_cache.keys()):
-                if not sym.startswith("/") and len(sym) <= 6:
+            cache_lock = getattr(self, "_symbol_cache_lock", None)
+            with cache_lock if cache_lock is not None else contextlib.nullcontext():
+                for sym in list(self.contract_id_to_symbol.values()):
                     self.active_subscriptions.add(sym)
+                for sym in list(self.symbol_to_id_cache.keys()):
+                    if not sym.startswith("/") and len(sym) <= 6:
+                        self.active_subscriptions.add(sym)
 
             # Wait up to 3 seconds for connection handshake to complete
             for _ in range(12):

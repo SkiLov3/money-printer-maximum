@@ -16,12 +16,13 @@ services:
       - .env
     environment:
       - OLLAMA_HOST=host.docker.internal:11434
+      - DASHBOARD_HOST=0.0.0.0
     # Resource limits to protect host machine
     deploy:
       resources:
         limits:
           cpus: '4.0'
-          memory: 2G
+          memory: 6G
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
