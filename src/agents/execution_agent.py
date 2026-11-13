@@ -38,6 +38,17 @@ class ExecutionAgent:
                 meta_fn = getattr(self.client, "get_contract_meta", None)
                 c_meta = meta_fn(symbol) if callable(meta_fn) else None
                 tick_sz = float(c_meta.get("tickSize") or 0.0) if isinstance(c_meta, dict) else 0.0
+                if tick_sz <= 0:
+                    from src.agents.strategy_agent import StrategyAgent
+                    from src.config.settings import (
+                        get_symbol_brackets,
+                        load_stack_config,
+                    )
+                    base_sym = StrategyAgent._extract_base_static(symbol)
+                    tick_sz = float(get_symbol_brackets(load_stack_config()).get(base_sym, {}).get("tick_size", 0.0) or 0.0)
+                side_norm = str(side or "").strip().lower()
+                is_buy = side_norm in ("buy", "long", "0")
+                is_sell = side_norm in ("sell", "short", "1")
                 if entry_ref is not None and tick_sz > 0:
                     try:
                         ep = float(entry_ref)
@@ -46,18 +57,18 @@ class ExecutionAgent:
                             if sp is not None:
                                 sp_f = float(sp)
                                 if math.isfinite(sp_f):
-                                    if side == "Buy" and sp_f < ep:
+                                    if is_buy and sp_f < ep:
                                         sl_ticks = max(1, int(math.ceil((ep - sp_f) / tick_sz)))
-                                    elif side == "Sell" and sp_f > ep:
+                                    elif is_sell and sp_f > ep:
                                         sl_ticks = max(1, int(math.ceil((sp_f - ep) / tick_sz)))
                             tp = metadata.get("target_price")
                             tr_mult = metadata.get("target_r_multiple")
                             if tp is not None:
                                 tp_f = float(tp)
                                 if math.isfinite(tp_f):
-                                    if side == "Buy" and tp_f > ep:
+                                    if is_buy and tp_f > ep:
                                         tp_ticks = max(1, int(math.floor((tp_f - ep) / tick_sz)))
-                                    elif side == "Sell" and tp_f < ep:
+                                    elif is_sell and tp_f < ep:
                                         tp_ticks = max(1, int(math.floor((ep - tp_f) / tick_sz)))
                             elif tr_mult is not None and sl_ticks:
                                 tr_f = float(tr_mult)

@@ -11,12 +11,27 @@ services:
     command: sh -c "sleep 2 && python main.py"
     restart: unless-stopped
     ports:
-      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8765}:8765"
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8765}:${DASHBOARD_PORT:-8765}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
       - OLLAMA_HOST=host.docker.internal:11434
       - DASHBOARD_HOST=0.0.0.0
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import os, urllib.request;
+          p = os.getenv("DASHBOARD_PORT", "8765");
+          urllib.request.urlopen(f"http://127.0.0.1:{p}/api/status", timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     # Resource limits to protect host machine
     deploy:
       resources:

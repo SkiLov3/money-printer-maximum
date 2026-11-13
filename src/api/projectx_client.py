@@ -56,6 +56,7 @@ PROJECTX_STATUS_CODES = {
 PROJECTX_ORDER_TYPE_CODES = {
     1: "limit",
     2: "market",
+    3: "stoplimit",
     4: "stop",
     5: "trailing_stop",
     6: "join_bid",
@@ -146,16 +147,16 @@ class ProjectXClient:
 
     @staticmethod
     def _build_refreshed_ws_url(base_url: str, access_token: str, existing_url: str | None) -> str:
-        from urllib.parse import parse_qs, urlparse
-        url = f"{base_url}?access_token={access_token}"
+        from urllib.parse import parse_qs, quote, urlparse
+        url = f"{base_url}?access_token={quote(str(access_token), safe='')}"
         if existing_url:
             try:
                 qs = parse_qs(urlparse(str(existing_url)).query)
                 conn_ids = qs.get("id")
                 if conn_ids and conn_ids[0]:
-                    url = f"{url}&id={conn_ids[0]}"
-            except Exception:
-                pass
+                    url = f"{url}&id={quote(str(conn_ids[0]), safe='')}"
+            except Exception as err:
+                logging.getLogger(__name__).debug(f"Failed to extract WS connection id: {err}")
         return url
 
     def _update_connection_urls(self):
@@ -437,24 +438,27 @@ class ProjectXClient:
             self.logger.error(f"Failed to fetch orders: {e}")
             return None
 
-    def has_working_stop_order(self, symbol: str, position_side: str) -> bool | None:
+    def has_working_stop_order(self, symbol: str, position_side: str, min_qty: int = 1) -> bool | None:
         """Checks if there is an active working stop-loss order protecting an open position.
 
         Args:
             symbol: Contract symbol (e.g. 'MCLZ6')
             position_side: 'Buy' (long position) or 'Sell' (short position)
+            min_qty: Minimum open contract quantity that working stop orders must cover.
 
         Returns:
-            True: If an active opposite-side stop order exists for the symbol.
-            False: If active orders were fetched successfully and no stop order exists.
+            True: If active opposite-side stop order(s) exist covering the position.
+            False: If active orders were fetched successfully and coverage is missing/insufficient.
             None: If active orders could not be fetched due to an API error/timeout.
         """
-        contract_id = self.symbol_to_id_cache.get(symbol)
-        if not contract_id:
-            meta = self.contract_cache.get(symbol)
-            if meta and meta.get("id"):
-                contract_id = meta.get("id")
-                self.symbol_to_id_cache[symbol] = contract_id
+        with self._symbol_cache_lock:
+            contract_id = self.symbol_to_id_cache.get(symbol)
+            if not contract_id:
+                meta = self.contract_cache.get(symbol)
+                if meta and meta.get("id"):
+                    contract_id = meta.get("id")
+                    self.symbol_to_id_cache[symbol] = contract_id
+            sym_aliases = dict(self.symbol_to_id_cache)
 
         active_orders = self.get_orders(active=True)
         if active_orders is None:
@@ -479,10 +483,13 @@ class ProjectXClient:
             "stop_loss",
             "stop_limit",
             "stoplimit",
+            "code_3",
             "code_4",
             "code_5",
         }
 
+        covered_qty = 0
+        has_unsized_stop = False
         for o in active_orders:
             oid = o.get("id")
             ocid = str(o.get("contractId") or "")
@@ -493,13 +500,19 @@ class ProjectXClient:
             try:
                 oside_int = int(raw_side) if raw_side is not None else -1
             except (ValueError, TypeError):
-                oside_int = 1 if str(raw_side).strip().lower() in ("sell", "short", "1") else 0
+                side_s = str(raw_side).strip().lower()
+                if side_s in ("sell", "short", "1"):
+                    oside_int = 1
+                elif side_s in ("buy", "long", "0"):
+                    oside_int = 0
+                else:
+                    oside_int = -1
 
             if not oid:
                 continue
 
             matches_contract = bool(target_cid and ocid == target_cid)
-            matches_symbol = bool(osym and (osym == symbol or (target_cid and self.symbol_to_id_cache.get(osym) == target_cid)))
+            matches_symbol = bool(osym and (osym == symbol or (target_cid and sym_aliases.get(osym) == target_cid)))
 
             if (
                 (matches_contract or matches_symbol)
@@ -507,9 +520,22 @@ class ProjectXClient:
                 and otype in STOP_TYPES
                 and oside_int == expected_stop_side_int
             ):
-                return True
+                rem_raw = o.get("remainingQty")
+                if rem_raw is None:
+                    rem_raw = o.get("leavesQty")
+                if rem_raw is None:
+                    rem_raw = o.get("size")
+                if rem_raw is None:
+                    has_unsized_stop = True
+                else:
+                    try:
+                        covered_qty += max(0, int(abs(float(rem_raw))))
+                    except (ValueError, TypeError):
+                        has_unsized_stop = True
 
-        return False
+        if covered_qty >= max(1, int(min_qty)):
+            return True
+        return bool(has_unsized_stop and covered_qty == 0)
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancels a single open order by ID via POST /Order/cancel.
@@ -798,7 +824,11 @@ class ProjectXClient:
                 m = re.search(r'\b([A-Z0-9]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', cid_str)
                 if m:
                     root, my = m.group(1), m.group(2)
-                    if root.endswith("E") and len(root) > 3:
+                    if root == "ENQ":
+                        root = "NQ"
+                    elif root == "EP":
+                        root = "ES"
+                    elif root.endswith("E") and len(root) > 3:
                         root = root[:-1]
                     if len(my) == 3:  # e.g. Z26 -> Z6
                         resolved = f"{root}{my[0]}{my[-1]}"
@@ -877,6 +907,7 @@ class ProjectXClient:
                     raw_vol = 0.0
 
                 cid_key = str(contract_id)
+                is_trade = trade_price is not None
                 if not hasattr(self, "_last_contract_volume"):
                     self._last_contract_volume = {}
                 prev_vol = self._last_contract_volume.get(cid_key)
@@ -886,7 +917,8 @@ class ProjectXClient:
                     else:
                         # First tick seen for this contract: only use raw_vol directly if it's small (e.g. unit test / session start)
                         tick_vol = raw_vol if raw_vol <= 500 else 0.0
-                    self._last_contract_volume[cid_key] = raw_vol
+                    if is_trade:
+                        self._last_contract_volume[cid_key] = raw_vol
                 else:
                     tick_vol = 0.0
                 
@@ -896,7 +928,7 @@ class ProjectXClient:
                     'contractId': cid_key,
                     'price': price,
                     'volume': tick_vol,
-                    'is_trade': trade_price is not None,
+                    'is_trade': is_trade,
                     'timestamp': tick_ts,
                     'raw': raw_data
                 }
@@ -1070,7 +1102,12 @@ class ProjectXClient:
                 envelope_account_id = None
                 payloads = []
                 if isinstance(message, list):
-                    if len(message) >= 2 and isinstance(message[0], (int, str)) and str(message[0]).isdigit():
+                    if (
+                        len(message) >= 2
+                        and isinstance(message[0], (int, str))
+                        and str(message[0]).isdigit()
+                        and (len(message) >= 3 or int(message[0]) > 100)
+                    ):
                         envelope_account_id = int(message[0])
                     if len(message) >= 3 and isinstance(message[2], dict):
                         payloads = [message[2]]
@@ -1109,7 +1146,8 @@ class ProjectXClient:
                             if int(p_acc_id) != int(self.account_id):
                                 continue
                         except (ValueError, TypeError):
-                            pass
+                            if str(p_acc_id).strip() != str(self.account_id).strip():
+                                continue
                     self.logger.info(f"[USER-HUB EVENT] {event_name} payload={p!r}")
                     if self._on_user_event:
                         self._on_user_event(event_name, p)
@@ -1296,47 +1334,48 @@ class ProjectXClient:
                 }
                 
                 # Cache tick metadata under base symbol, resolved name, and display name
-                self.contract_cache[base_symbol] = meta
-                self.symbol_to_id_cache[base_symbol] = contract_id
-                self.symbol_to_id_cache[f"/{base_symbol}"] = contract_id
-                if resolved_name:
-                    self.contract_cache[resolved_name] = meta
-                    self.symbol_to_id_cache[resolved_name] = contract_id
-                    self.symbol_to_id_cache[f"/{resolved_name}"] = contract_id
-                if display_name:
-                    self.contract_cache[display_name] = meta
-                    self.symbol_to_id_cache[display_name] = contract_id
-                    self.symbol_to_id_cache[f"/{display_name}"] = contract_id
+                with self._symbol_cache_lock:
+                    self.contract_cache[base_symbol] = meta
+                    self.symbol_to_id_cache[base_symbol] = contract_id
+                    self.symbol_to_id_cache[f"/{base_symbol}"] = contract_id
+                    if resolved_name:
+                        self.contract_cache[resolved_name] = meta
+                        self.symbol_to_id_cache[resolved_name] = contract_id
+                        self.symbol_to_id_cache[f"/{resolved_name}"] = contract_id
+                    if display_name:
+                        self.contract_cache[display_name] = meta
+                        self.symbol_to_id_cache[display_name] = contract_id
+                        self.symbol_to_id_cache[f"/{display_name}"] = contract_id
 
-                # Generate 1-digit vs 2-digit year aliases (e.g. MESZ6 <-> MESZ26, MCLX6 <-> MCLX26)
-                import re
-                aliases = []
-                for s in (resolved_name, display_name):
-                    if not s:
-                        continue
-                    m = re.match(r'^([A-Z0-9]+[FGHJKMNQUVXZ])(\d{1,2})$', s)
-                    if m:
-                        root, yr = m.group(1), m.group(2)
-                        if len(yr) == 1:
-                            alias = f"{root}2{yr}"
-                        elif len(yr) == 2 and yr.startswith("2"):
-                            alias = f"{root}{yr[-1]}"
-                        else:
-                            alias = None
-                        if alias:
-                            aliases.append(alias)
-                            self.symbol_to_id_cache[alias] = contract_id
-                            self.symbol_to_id_cache[f"/{alias}"] = contract_id
-                            self.contract_cache[alias] = meta
+                    # Generate 1-digit vs 2-digit year aliases (e.g. MESZ6 <-> MESZ26, MCLX6 <-> MCLX26)
+                    import re
+                    aliases = []
+                    for s in (resolved_name, display_name):
+                        if not s:
+                            continue
+                        m = re.match(r'^([A-Z0-9]+[FGHJKMNQUVXZ])(\d{1,2})$', s)
+                        if m:
+                            root, yr = m.group(1), m.group(2)
+                            if len(yr) == 1:
+                                alias = f"{root}2{yr}"
+                            elif len(yr) == 2 and yr.startswith("2"):
+                                alias = f"{root}{yr[-1]}"
+                            else:
+                                alias = None
+                            if alias:
+                                aliases.append(alias)
+                                self.symbol_to_id_cache[alias] = contract_id
+                                self.symbol_to_id_cache[f"/{alias}"] = contract_id
+                                self.contract_cache[alias] = meta
 
-                candidates = [c for c in (resolved_name, display_name, *aliases, base_symbol) if c]
-                one_digit = [c for c in candidates if re.search(r'^[A-Z0-9]+[FGHJKMNQUVXZ]\d$', c)]
-                primary_symbol = one_digit[0] if one_digit else (resolved_name or display_name or base_symbol)
-                self.contract_id_to_symbol[contract_id] = primary_symbol
-                self.contract_id_to_symbol[str(contract_id)] = primary_symbol
-                self.active_subscriptions.add(primary_symbol)
-                if resolved_name:
-                    self.active_subscriptions.add(resolved_name)
+                    candidates = [c for c in (resolved_name, display_name, *aliases, base_symbol) if c]
+                    one_digit = [c for c in candidates if re.search(r'^[A-Z0-9]+[FGHJKMNQUVXZ]\d$', c)]
+                    primary_symbol = one_digit[0] if one_digit else (resolved_name or display_name or base_symbol)
+                    self.contract_id_to_symbol[contract_id] = primary_symbol
+                    self.contract_id_to_symbol[str(contract_id)] = primary_symbol
+                    self.active_subscriptions.add(primary_symbol)
+                    if resolved_name:
+                        self.active_subscriptions.add(resolved_name)
 
                 self.logger.info(
                     f"Resolved '{base_symbol}' -> '{resolved_name}' (id={contract_id}, display={display_name}) "

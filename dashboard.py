@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 logger = logging.getLogger("dashboard")
 
 STATUS_FILE = Path("logs/bot_status.json")
@@ -442,6 +446,7 @@ const sessionBadge = sess => {
 
 const chartFrames = ['1m','5m','15m','30m','1h','4h','1d'];
 const chartZoomPercents = [25, 50, 75, 100, 125, 150, 200, 300, 400, 600, 800, 1000, 2000];
+let latestStatus = null;
 let activeTab = 'overview';
 let activeChartFrame = '1m';
 let activeChartSymbol = '';
@@ -864,6 +869,7 @@ async function refresh() {
     const r = await fetch('/api/status?' + Date.now());
     if (!r.ok) throw new Error();
     const d = await r.json();
+    latestStatus = d;
     $('offline').classList.remove('show');
 
     setBadge('badge-running', d.running ? 'badge-green' : 'badge-red', d.running ? 'dot-green' : 'dot-red', d.running ? 'RUNNING' : 'STOPPED');
@@ -1365,7 +1371,7 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             return True
         referer = self.headers.get("Referer")
-        if referer and host and urlparse(referer).netloc != host:
+        if referer and (not host or urlparse(referer).netloc != host):
             self.send_response(403)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1555,14 +1561,18 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
                 except Exception:
-                    data = {}
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Status file unavailable"}).encode("utf-8"))
+                    return
                 sat_state_file = Path("logs/saturday_optimizer_state.json")
                 if sat_state_file.exists():
                     try:
                         data["saturday_optimizer"] = json.loads(sat_state_file.read_text(encoding="utf-8"))
                     except Exception as exc:
                         logger.debug("Failed to read saturday optimizer state: %s", exc)
-                payload_bytes = json.dumps(data).encode("utf-8")
+                payload_bytes = json.dumps(data, allow_nan=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")

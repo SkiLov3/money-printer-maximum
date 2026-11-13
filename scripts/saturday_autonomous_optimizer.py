@@ -24,6 +24,7 @@ import fcntl
 import gc
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -197,6 +198,21 @@ SCHEMA_CERTIFICATION = {
 }
 
 
+def _sanitize_json_numbers(obj: Any) -> Any:
+    """Replace non-finite floats (inf/-inf/nan) with finite JSON-safe equivalents."""
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return 0.0
+        if math.isinf(obj):
+            return 999.0 if obj > 0 else -999.0
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_numbers(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json_numbers(v) for v in obj]
+    return obj
+
+
 class StateManager:
     """Resumable state machine to survive machine reboots, sleep, or interruptions."""
 
@@ -241,8 +257,9 @@ class StateManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         try:
+            sanitized = _sanitize_json_numbers(self.state)
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
+                json.dump(sanitized, f, indent=2, allow_nan=False)
             os.replace(tmp, self.path)
         except Exception as e:
             logger.error(f"Failed to persist state file {self.path}: {e}")
@@ -365,11 +382,13 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
         return []
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    src_con = sqlite3.connect(str(db_path), timeout=10.0)
-    src_con.execute("PRAGMA busy_timeout=10000")
-    con = sqlite3.connect(":memory:")
-    con.row_factory = sqlite3.Row
+    src_con: sqlite3.Connection | None = None
+    con: sqlite3.Connection | None = None
     try:
+        src_con = sqlite3.connect(str(db_path), timeout=10.0)
+        src_con.execute("PRAGMA busy_timeout=10000")
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
         src_con.backup(con)
         rows = con.execute(
             """
@@ -396,9 +415,14 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
             (cutoff,),
         ).fetchall()
         return [dict(r) for r in rows]
+    except sqlite3.Error as exc:
+        logger.warning(f"Failed to extract recent trades from {db_path}: {exc}")
+        return []
     finally:
-        con.close()
-        src_con.close()
+        if con is not None:
+            con.close()
+        if src_con is not None:
+            src_con.close()
 
 
 def _format_trade_sample(t: dict[str, Any]) -> dict[str, Any]:
@@ -828,9 +852,23 @@ def evaluate_backtest_candidate(
             portfolio_trades.extend(f.result())
 
     if not portfolio_trades:
-        return {"total_trades": 0, "profit_factor": 0.0, "total_pnl": 0.0, "holdout_pnl": 0.0}
+        return {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown": 0.0,
+            "in_sample_trades": 0,
+            "in_sample_pnl": 0.0,
+            "in_sample_pf": 0.0,
+            "in_sample_max_drawdown": 0.0,
+            "holdout_pnl": 0.0,
+            "holdout_pf": 0.0,
+            "holdout_trades": 0,
+            "holdout_win_rate": 0.0,
+        }
 
-    portfolio_trades.sort(key=lambda x: str(x.get("time_open", "")))
+    portfolio_trades.sort(key=lambda x: str(x.get("time_close") or x.get("time_open") or ""))
     total_trades = len(portfolio_trades)
     wins = [t for t in portfolio_trades if t.get("pnl", 0) > 0]
     losses = [t for t in portfolio_trades if t.get("pnl", 0) < 0]
@@ -838,7 +876,7 @@ def evaluate_backtest_candidate(
     total_pnl = sum(t.get("pnl", 0) for t in portfolio_trades)
     gross_win = sum(t.get("pnl", 0) for t in wins)
     gross_loss = abs(sum(t.get("pnl", 0) for t in losses))
-    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    pf = min(999.0, gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
 
     cum_pnl = 0.0
     peak_pnl = 0.0
@@ -866,7 +904,7 @@ def evaluate_backtest_candidate(
     insample_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample)
     is_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) > 0)
     is_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) < 0))
-    insample_pf = is_wins / is_losses if is_losses > 0 else (float("inf") if is_wins > 0 else 0.0)
+    insample_pf = min(999.0, is_wins / is_losses) if is_losses > 0 else (999.0 if is_wins > 0 else 0.0)
     is_cum = 0.0
     is_peak = 0.0
     insample_mdd = 0.0
@@ -882,7 +920,7 @@ def evaluate_backtest_candidate(
         holdout_wr = sum(1 for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0) / len(holdout)
         ho_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0)
         ho_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) < 0))
-        holdout_pf = ho_wins / ho_losses if ho_losses > 0 else (float("inf") if ho_wins > 0 else 0.0)
+        holdout_pf = min(999.0, ho_wins / ho_losses) if ho_losses > 0 else (999.0 if ho_wins > 0 else 0.0)
     else:
         holdout_pnl = 0.0
         holdout_wr = 0.0
@@ -1263,40 +1301,36 @@ def _run_optimizer_locked(
         base_is_pnl = base_metrics.get("in_sample_pnl", base_metrics.get("total_pnl", 0.0))
         base_is_mdd = base_metrics.get("in_sample_max_drawdown", base_metrics.get("max_drawdown", 1000.0))
         base_holdout = base_metrics.get("holdout_pnl", 0.0)
-        base_mdd = base_metrics.get("max_drawdown", 1000.0)
-        base_trades = int(base_metrics.get("total_trades", 0) or 0)
-        min_required_trades = min(80, max(min(40, base_trades), int(base_trades * 0.75))) if base_trades > 0 else 40
-        logger.info(f"Validation gate minimum trade threshold: {min_required_trades} trades (baseline={base_trades})")
+        base_is_trades = int(base_metrics.get("in_sample_trades", base_metrics.get("total_trades", 0)) or 0)
+        min_required_is_trades = min(80, max(min(40, base_is_trades), int(base_is_trades * 0.75))) if base_is_trades > 0 else 40
+        logger.info(f"Validation gate minimum in-sample trade threshold: {min_required_is_trades} trades (baseline IS={base_is_trades})")
         if eval_results:
             no_effect_rate = sum(1 for r in eval_results if r.get("no_effect")) / len(eval_results)
             if no_effect_rate > 0.5:
                 logger.warning(f"High no_effect rate ({no_effect_rate:.1%}) in candidate sweep — review parameter mappings.")
 
-        max_allowed_mdd = max(base_mdd * 1.15, 600.0)
         max_allowed_is_mdd = max(base_is_mdd * 1.15, 600.0)
         for cand in eval_results:
             is_pf = cand.get("in_sample_pf", cand.get("profit_factor", 0.0))
             is_pnl = cand.get("in_sample_pnl", cand.get("total_pnl", 0.0))
             is_mdd = cand.get("in_sample_max_drawdown", cand.get("max_drawdown", float("inf")))
-            total_trades = cand.get("total_trades", 0)
-            cand_mdd = cand.get("max_drawdown", float("inf"))
+            is_trades = int(cand.get("in_sample_trades", cand.get("total_trades", 0)) or 0)
 
             if (
                 not cand.get("no_effect")
                 and is_pf >= 1.25
                 and is_pf >= base_is_pf
                 and is_pnl > 0
-                and total_trades >= min_required_trades
+                and is_trades >= min_required_is_trades
                 and is_mdd <= max_allowed_is_mdd
-                and cand_mdd <= max_allowed_mdd
                 and (is_pf, is_pnl, -is_mdd) > (base_is_pf, base_is_pnl, -base_is_mdd)
             ):
                 if best_in_sample is None or (
-                    (is_pf, is_pnl, total_trades, -is_mdd)
+                    (is_pf, is_pnl, is_trades, -is_mdd)
                     > (
                         best_in_sample.get("in_sample_pf", best_in_sample.get("profit_factor", 0.0)),
                         best_in_sample.get("in_sample_pnl", best_in_sample.get("total_pnl", 0.0)),
-                        best_in_sample.get("total_trades", 0),
+                        int(best_in_sample.get("in_sample_trades", best_in_sample.get("total_trades", 0)) or 0),
                         -best_in_sample.get("in_sample_max_drawdown", best_in_sample.get("max_drawdown", float("inf"))),
                     )
                 ):
@@ -1358,7 +1392,11 @@ def _run_optimizer_locked(
                 f"Baseline: PF={base_metrics['profit_factor']:.2f}, Holdout=${base_metrics['holdout_pnl']:+7.2f}\n"
                 f"Candidate: PF={winner['profit_factor']:.2f}, Holdout=${winner['holdout_pnl']:+7.2f}\n"
             )
-            stage_atomic_config_update(promoted_cfg, summary, dry_run=dry_run)
+            promoted_ok = stage_atomic_config_update(promoted_cfg, summary, dry_run=dry_run)
+            if not promoted_ok:
+                logger.warning(f"Config promotion skipped/aborted for {winner.get('candidate_id')}; keeping baseline active.")
+                mgr.state["promoted_candidate"] = None
+                winner = None
 
         generate_optimization_report(
             mgr.state,

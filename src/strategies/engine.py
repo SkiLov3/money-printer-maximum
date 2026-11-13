@@ -148,6 +148,8 @@ class StrategyEngine:
     def reset(self):
         self._last_processed_timestamp = None
         self._last_snapshot = {}
+        self._last_candidates = []
+        self._last_selected = None
         self._cached_indicators_key = None
         self._cached_indicators_df = None
         self._cached_summary = None
@@ -315,6 +317,9 @@ class StrategyEngine:
         }, candidate_blend_data
 
     def prime(self, bars: pd.DataFrame, indicators: pd.DataFrame, end_index: int):
+        if indicators.empty or end_index < 0:
+            return
+        end_index = min(int(end_index), len(indicators) - 1)
         for strategy in self.strategies:
             strategy.is_priming = True
         try:
@@ -323,9 +328,10 @@ class StrategyEngine:
         finally:
             for strategy in self.strategies:
                 strategy.is_priming = False
-        
-        if not indicators.empty:
-            self._last_processed_timestamp = indicators.iloc[end_index].get("timestamp")
+
+        ts_val = indicators.iloc[end_index].get("timestamp")
+        if ts_val is not None and not pd.isna(ts_val):
+            self._last_processed_timestamp = ts_val
 
     def analyze(self, data: pd.DataFrame):
         if data.empty:
@@ -350,12 +356,18 @@ class StrategyEngine:
             start_idx = last_idx
 
         for idx in range(start_idx, last_idx + 1):
+            row_ts = indicators.iloc[idx].get("timestamp")
+            if self._last_processed_timestamp is not None and row_ts is not None:
+                try:
+                    if pd.isna(row_ts) or row_ts <= self._last_processed_timestamp:
+                        continue
+                except TypeError:
+                    pass
             res, _ = self.evaluate_index(bars, indicators, idx)
+            if row_ts is not None and not pd.isna(row_ts):
+                self._last_processed_timestamp = row_ts
             if idx == last_idx:
                 signal = res
-
-        if not indicators.empty:
-            self._last_processed_timestamp = indicators.iloc[-1].get("timestamp")
 
         return signal
 

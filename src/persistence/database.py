@@ -29,7 +29,9 @@ class DatabaseService:
             self.reason = "disabled"
             return
         if self.backend == "sqlite":
-            os.makedirs(os.path.dirname(self.sqlite_path), exist_ok=True)
+            db_dir = os.path.dirname(self.sqlite_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
             # FIX H11: Use check_same_thread=False but PROTECT with self._lock
             self._conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row

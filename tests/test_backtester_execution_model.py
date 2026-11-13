@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false, reportGeneralTypeIssues=false
 import pandas as pd
 
 from src.utils.backtester import Backtester
@@ -248,6 +249,7 @@ def test_backtester_reversal_trade_recorded():
         routing_mode="optimizer_fast",
         execution_model="same_bar_open",
     )
+    bt.routing_config.setdefault("entry_filters", {})["allow_flips"] = True
     bt.strategy.engine = _ReversalSignalEngine()
     bt.strategy._calculate_indicators = lambda frame: frame.assign(price=frame["close"])
     bt.slippage_ticks = 0

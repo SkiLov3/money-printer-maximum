@@ -432,4 +432,81 @@ def test_optimizer_yaml_time_quoting_and_dashboard_referer_csrf():
     # Cross-origin Referer without Origin must be rejected
     handler.headers = _build_headers({"Host": "localhost:8765", "Referer": "http://evil.com/attack.html"})
     assert not handler._check_same_origin()
+    # Referer with missing Host must also be rejected
+    handler.headers = _build_headers({"Referer": "http://localhost:8765/"})
+    assert not handler._check_same_origin()
+
+
+def test_backtester_optimizer_fast_honors_allow_flips_false():
+    bt: Any = Backtester.__new__(Backtester)
+    bt.routing_mode = "optimizer_fast"
+    bt.routing_config = {"entry_filters": {"allow_flips": False}}
+    bt.active_trades = [{"side": "Buy", "qty": 1}]
+    bt.risk_agent = MagicMock()
+    res = bt._route_signal(
+        {"side": "Sell", "quantity": 1, "sl_ticks": 20, "metadata": {}},
+        {"active_count": 1, "max_positions": 1, "current_price": 5000.0},
+    )
+    assert getattr(res, "stage", None) == "filter"
+
+
+def test_supervisor_partial_fill_zero_volume_cancelled_and_partial_exit_releases_guard():
+    async def _run():
+        with patch("src.agents.supervisor_agent.DatabaseService"):
+            sup = SupervisorAgent(["MCL"], "12345")
+        sup.loop = asyncio.get_running_loop()
+        sup.client.cancel_open_orders_for_symbol = MagicMock(return_value=0)
+        sup.active_positions["MCLZ6"] = [{"side": "Buy", "qty": 3, "entry": 88.5, "time": 1000.0, "trade_key": "tk-1"}]
+
+        # 1. status="3" (cancelled) must NOT trigger a fill
+        sup.on_order_update({"id": 8001, "contractId": "MCLZ6", "status": 3, "type": 4, "side": 1, "size": 3})
+        await asyncio.sleep(0.05)
+        assert sum(p["qty"] for p in sup.active_positions["MCLZ6"]) == 3
+
+        # 2. status=7 (partially_filled) with fillVolume=0 must NOT fall back to size=3
+        sup.on_order_update({"id": 8002, "contractId": "MCLZ6", "status": 7, "type": 4, "side": 1, "fillVolume": 0, "size": 3})
+        await asyncio.sleep(0.05)
+        assert sum(p["qty"] for p in sup.active_positions["MCLZ6"]) == 3
+
+        # 3. Partial exit (1 of 3) must release _close_in_flight once lock completes and not increment loss streak
+        sup._consecutive_losses["MCLZ6"] = 0
+        sup.on_order_update({"id": 8003, "contractId": "MCLZ6", "status": 7, "type": 4, "side": 1, "fillVolume": 1, "profitAndLoss": -15.0})
+        await asyncio.sleep(0.05)
+        assert sum(p["qty"] for p in sup.active_positions["MCLZ6"]) == 2
+        assert sup._close_in_flight.get("MCLZ6") is None
+        assert sup._consecutive_losses.get("MCLZ6", 0) == 0
+
+    asyncio.run(_run())
+
+
+def test_state_manager_sanitizes_infinity_and_db_bare_filename(tmp_path):
+    from scripts.saturday_autonomous_optimizer import StateManager
+    from src.persistence.database import DatabaseService
+
+    state_file = tmp_path / "sat_state.json"
+    mgr = StateManager(state_file)
+    mgr.state["baseline_metrics"] = {"profit_factor": float("inf"), "bad_nan": float("nan")}
+    mgr.save()
+    loaded = json.loads(state_file.read_text(encoding="utf-8"))
+    assert loaded["baseline_metrics"]["profit_factor"] == 999.0
+    assert loaded["baseline_metrics"]["bad_nan"] == 0.0
+
+    # Bare filename without directory component must not raise FileNotFoundError
+    orig_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        db = DatabaseService({"enabled": True, "backend": "sqlite", "sqlite_path": "bare_swarm.db"})
+        assert db.connected is True
+        db.close()
+    finally:
+        os.chdir(orig_cwd)
+
+
+def test_strategy_engine_reset_clears_candidates():
+    eng = StrategyEngine("MESZ6", 1, {"sl": 40, "tp": 80, "tick_size": 0.25}, config={"strategies": []})
+    eng._last_candidates = [{"side": "Buy"}]
+    eng._last_selected = {"side": "Buy"}
+    eng.reset()
+    assert eng._last_candidates == []
+    assert eng._last_selected is None
 
