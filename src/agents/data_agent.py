@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone
+from typing import cast
 
 import pandas as pd
 
@@ -53,7 +54,7 @@ class DataAgent:
         
         # Completed OHLCV bars for the strategy
         # FIX: Explicitly set dtypes to avoid 'object' type issues during math/indicators
-        self.bars = pd.DataFrame({
+        self.bars: pd.DataFrame = pd.DataFrame({
             'timestamp': pd.Series(dtype='datetime64[ns]'),
             'open': pd.Series(dtype='float64'),
             'high': pd.Series(dtype='float64'),
@@ -69,6 +70,7 @@ class DataAgent:
         self.current_bar = None  # {open, high, low, close, volume, start_time}
         self.tick_count = 0
         self.total_bars_generated = 0
+        self._live_closed_timestamps: set[datetime] = set()
 
     def _matches_symbol(self, incoming: str) -> bool:
         if not incoming:
@@ -124,6 +126,13 @@ class DataAgent:
             raw_ts = data.get('timestamp') or data.get('time') or data.get('t')
             tick_dt = parse_market_timestamp(raw_ts)
 
+            # Ignore pure bid/ask quote updates (no executed trade) for OHLC bar building
+            # so synthetic midpoints never pollute bar open/high/low/close.
+            if data.get('is_trade') is False:
+                with self.lock:
+                    self.check_bar_expiry(tick_dt)
+                return
+
             # Bucket start_time strictly to the top of the calendar minute (e.g. 09:30:00)
             minute_start = tick_dt.replace(second=0, microsecond=0)
 
@@ -133,8 +142,11 @@ class DataAgent:
                     self.logger.debug(f"Ignoring late tick {tick_dt} for earlier bar {minute_start}")
                     return
 
-                # Reject ticks belonging to earlier closed historical bars
-                if not self.bars.empty and minute_start < self.bars['timestamp'].iloc[-1]:
+                # Reject ticks belonging to earlier closed historical bars or already-closed live bars
+                if minute_start in self._live_closed_timestamps:
+                    self.logger.debug(f"Ignoring late tick {tick_dt} for already-closed live bar {minute_start}")
+                    return
+                if not self.bars.empty and minute_start < pd.Timestamp(self.bars['timestamp'].iloc[-1]).to_pydatetime():
                     self.logger.debug(f"Ignoring stale tick {tick_dt} for already closed bar {minute_start}")
                     return
 
@@ -176,7 +188,7 @@ class DataAgent:
         except Exception as e:
             self.logger.error(f"Error processing market data for {self.symbol}: {e}")
 
-    def check_bar_expiry(self, now=None):
+    def check_bar_expiry(self, now=None, grace_seconds: float = 0.0):
         """Checks if the current bar has expired based on time and closes it if so."""
         if now is None:
             now = datetime.now(timezone.utc).astimezone()
@@ -188,7 +200,7 @@ class DataAgent:
         with self.lock:
             if self.current_bar:
                 elapsed = (now - self.current_bar['start_time']).total_seconds()
-                if elapsed >= self.bar_interval:
+                if elapsed >= self.bar_interval + max(0.0, float(grace_seconds or 0.0)):
                     self.logger.debug(f"Bar interval {self.bar_interval}s elapsed ({elapsed:.1f}s). Closing bar.")
                     self._close_bar(now)
 
@@ -224,12 +236,15 @@ class DataAgent:
         if type_map:
             new_bar_df = new_bar_df.astype(type_map)
 
-        self.bars = pd.concat([self.bars, new_bar_df], ignore_index=True)
-        self.bars = self.bars.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(drop=True)
+        merged_df = cast(pd.DataFrame, pd.concat([self.bars, new_bar_df], ignore_index=True))
+        self.bars = cast(
+            pd.DataFrame,
+            merged_df.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(drop=True),
+        )
         
         # Trim to max size
         if len(self.bars) > self.max_bars:
-            self.bars = self.bars.iloc[-self.max_bars:].reset_index(drop=True)
+            self.bars = cast(pd.DataFrame, self.bars.iloc[-self.max_bars:].reset_index(drop=True))
         
         self.logger.debug(
             f"Bar closed: O={new_bar['open']:.2f} H={new_bar['high']:.2f} "
@@ -237,6 +252,10 @@ class DataAgent:
         )
         
         # Reset for next bar
+        self._live_closed_timestamps.add(start_time)
+        if len(self._live_closed_timestamps) > 2000:
+            oldest = sorted(self._live_closed_timestamps)[:1000]
+            self._live_closed_timestamps.difference_update(oldest)
         self.current_bar = None
         self.tick_count = 0
         self.total_bars_generated += 1
@@ -253,7 +272,7 @@ class DataAgent:
             bars = self._bars_with_current_locked()
         return resample_timeframe(bars, normalized).tail(int(limit or 500)).reset_index(drop=True)
 
-    def _bars_with_current_locked(self):
+    def _bars_with_current_locked(self) -> pd.DataFrame:
         bars = self.bars.copy()
         if self.current_bar is None:
             return bars
@@ -273,8 +292,11 @@ class DataAgent:
                 }
             ]
         )
-        combined = pd.concat([bars, current], ignore_index=True)
-        return combined.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+        combined = cast(pd.DataFrame, pd.concat([bars, current], ignore_index=True))
+        return cast(
+            pd.DataFrame,
+            combined.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True),
+        )
     
     def get_bar_count(self):
         """Returns the total number of bars generated across the lifetime of the agent."""
@@ -334,10 +356,13 @@ class DataAgent:
 
             # Combine with existing (if any) and trim
             if not history_df.empty:
-                self.bars = pd.concat([self.bars, history_df], ignore_index=True)
-                self.bars = self.bars.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(drop=True)
+                merged_hist = cast(pd.DataFrame, pd.concat([self.bars, history_df], ignore_index=True))
+                self.bars = cast(
+                    pd.DataFrame,
+                    merged_hist.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(drop=True),
+                )
                 if len(self.bars) > self.max_bars:
-                    self.bars = self.bars.iloc[-self.max_bars:].reset_index(drop=True)
+                    self.bars = cast(pd.DataFrame, self.bars.iloc[-self.max_bars:].reset_index(drop=True))
 
             self.total_bars_generated = max(
                 getattr(self, "total_bars_generated", 0) + max(new_unique_count, 0),

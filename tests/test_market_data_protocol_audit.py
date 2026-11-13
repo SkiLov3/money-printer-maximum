@@ -14,7 +14,8 @@ class TestMarketDataSymbolVariantRouting:
         client.symbol_to_id_cache = {"MESZ6": "12345", "MES": "12345"}
         
         # Inbound numeric int
-        assert client.lookup_symbol_for_contract_id(12345) == "MESZ6"
+        raw_id = 12345
+        assert client.lookup_symbol_for_contract_id(raw_id) == "MESZ6"  # type: ignore[arg-type]
         # Inbound numeric string
         assert client.lookup_symbol_for_contract_id("12345") == "MESZ6"
 
@@ -81,12 +82,14 @@ class TestDataAgentTimestampAndBarLifecycle:
         
         # Initial tick at 09:31:10
         agent.handle_market_data({"symbol": "MESZ6", "price": 5800.0, "volume": 1, "timestamp": "2026-09-29T09:31:10Z"})
+        assert agent.current_bar is not None
         assert agent.current_bar["start_time"].minute == 31
         assert agent.current_bar["high"] == 5800.0
         
         # Late tick from 09:30:55 arrives late due to network jitter
         agent.handle_market_data({"symbol": "MESZ6", "price": 5999.0, "volume": 10, "timestamp": "2026-09-29T09:30:55Z"})
         # Should not corrupt 09:31 bar
+        assert agent.current_bar is not None
         assert agent.current_bar["high"] == 5800.0
         assert agent.tick_count == 1
 
@@ -204,4 +207,65 @@ class TestStrategyEngineSessionRegime:
         eng = StrategyEngine("MES", 1, {})
         regime = eng._compute_session_regime(None)
         assert regime in ("NY RTH", "NY PRE", "ASIAN", "GLOBEX", "MAINTENANCE", "CLOSED")
+
+
+class TestLiveDataAccuracyAndPreopenWarmup:
+    def test_data_agent_ignores_non_trade_quote_midpoints(self):
+        agent = DataAgent("MCLZ6", bar_interval_seconds=60)
+        # Executed trade at 88.73
+        agent.handle_market_data({"symbol": "MCLZ6", "price": 88.73, "volume": 10, "is_trade": True, "timestamp": "2026-11-12T23:46:15Z"})
+        # Quote-only midpoint update (is_trade=False) must NOT mutate OHLC
+        agent.handle_market_data({"symbol": "MCLZ6", "price": 88.71, "volume": 0, "is_trade": False, "timestamp": "2026-11-12T23:46:45Z"})
+        assert agent.current_bar is not None
+        assert agent.current_bar["close"] == 88.73
+        assert agent.current_bar["low"] == 88.73
+
+        # Quote-only tick in next minute still triggers bar expiry so the bar closes cleanly at 88.73
+        agent.handle_market_data({"symbol": "MCLZ6", "price": 88.74, "volume": 0, "is_trade": False, "timestamp": "2026-11-12T23:47:01Z"})
+        assert agent.current_bar is None
+        assert len(agent.bars) == 1
+        assert agent.bars.iloc[-1]["close"] == 88.73
+
+    def test_data_agent_rejects_late_tick_for_live_closed_bar(self):
+        from datetime import datetime, timezone
+
+        agent = DataAgent("MESZ6", bar_interval_seconds=60)
+        agent.handle_market_data({"symbol": "MESZ6", "price": 7544.0, "volume": 500, "is_trade": True, "timestamp": "2026-11-13T16:27:10Z"})
+        # Grace period: 16:28:00.5 does NOT close yet when grace_seconds=2.0
+        agent.check_bar_expiry(datetime(2026, 11, 13, 16, 28, 0, 500000, tzinfo=timezone.utc), grace_seconds=2.0)
+        assert agent.current_bar is not None
+
+        # Past grace period (16:28:02.5): closes cleanly
+        agent.check_bar_expiry(datetime(2026, 11, 13, 16, 28, 2, 500000, tzinfo=timezone.utc), grace_seconds=2.0)
+        assert agent.current_bar is None
+        assert len(agent.bars) == 1
+        assert agent.bars.iloc[-1]["volume"] == 500.0
+
+        # Late 16:27:59 tick arriving after 16:27 bar already closed live must NOT reopen/overwrite it
+        agent.handle_market_data({"symbol": "MESZ6", "price": 7546.75, "volume": 1, "is_trade": True, "timestamp": "2026-11-13T16:27:59Z"})
+        assert agent.current_bar is None
+        assert len(agent.bars) == 1
+        assert agent.bars.iloc[-1]["volume"] == 500.0
+        assert agent.bars.iloc[-1]["close"] == 7544.0
+
+    def test_supervisor_seconds_until_next_globex_open(self):
+        from datetime import datetime, timezone
+
+        # Thursday 17:58:30 ET == 22:58:30 UTC (Nov is EST = UTC-5)
+        dt_preopen = datetime(2026, 11, 12, 22, 58, 30, tzinfo=timezone.utc)
+        secs = SupervisorAgent._seconds_until_next_globex_open(dt_preopen)
+        assert secs == 90.0
+
+        # Wednesday 17:30:00 ET == 22:30:00 UTC
+        dt_maint = datetime(2026, 11, 11, 22, 30, 0, tzinfo=timezone.utc)
+        assert SupervisorAgent._seconds_until_next_globex_open(dt_maint) == 1800.0
+
+        # Friday 17:30:00 ET == 22:30:00 UTC (weekend closure, not opening at 18:00 ET)
+        dt_fri = datetime(2026, 11, 13, 22, 30, 0, tzinfo=timezone.utc)
+        assert SupervisorAgent._seconds_until_next_globex_open(dt_fri) is None
+
+        # Sunday 17:59:00 ET == 22:59:00 UTC
+        dt_sun = datetime(2026, 11, 15, 22, 59, 0, tzinfo=timezone.utc)
+        assert SupervisorAgent._seconds_until_next_globex_open(dt_sun) == 60.0
+
 

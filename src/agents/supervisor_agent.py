@@ -130,6 +130,7 @@ class SupervisorAgent:
         # and does NOT re-trigger the emergency flatten on every subsequent tick.
         self._risk_halt: bool = False
         self._session_reset_done: bool = False  # True once we've reset for the current maintenance window
+        self._preopen_streams_ready: bool = False
         self._session_opening_balance: Decimal | None = None
         self._balance_persistence_path = Path("logs/session_opening_balance.json")
         self._restore_balance_persistence()
@@ -493,6 +494,43 @@ class SupervisorAgent:
         self._warmup_complete = True
         await self.run()
 
+    @staticmethod
+    def _seconds_until_next_globex_open(now_dt: datetime) -> float | None:
+        """Return seconds until 18:00 ET Globex open when currently inside a pre-open maintenance/Sunday window."""
+        try:
+            import zoneinfo
+            et_tz = zoneinfo.ZoneInfo("America/New_York")
+            dt_utc = now_dt if now_dt.tzinfo is not None else now_dt.replace(tzinfo=timezone.utc)
+            dt_et = dt_utc.astimezone(et_tz)
+            wd = dt_et.weekday()
+            # Mon-Thu 17:00-18:00 ET or Sunday before 18:00 ET
+            if (wd in (0, 1, 2, 3) and dt_et.hour == 17) or (wd == 6 and dt_et.hour < 18):
+                open_et = dt_et.replace(hour=18, minute=0, second=0, microsecond=0)
+                secs = (open_et - dt_et).total_seconds()
+                return max(0.0, secs)
+        except Exception:
+            return None
+        return None
+
+    async def _prepare_session_open_streams(self, last_processed_bar_count: dict[str, int]) -> None:
+        """Resolve contract rollovers, reconnect SignalR streams, and backfill bars ahead of 18:00 ET open."""
+        self.client.last_tick_at = time.time()
+        for base_sym, old_off in list(getattr(self, "symbol_map", {}).items()):
+            if not self.active_positions.get(old_off):
+                try:
+                    new_off = await self.loop.run_in_executor(None, self.client.resolve_symbol, base_sym)
+                    if new_off and new_off != old_off:
+                        self.logger.warning(f"[CONTRACT ROLLOVER] {base_sym} rolled from {old_off} -> {new_off}")
+                except Exception as roll_exc:
+                    self.logger.debug(f"Rollover check skipped for {base_sym}: {roll_exc}")
+        await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
+        self.client.subscribe_market_data(self.official_symbols)
+        await self._smart_sleep(3)
+        await self._refresh_recent_bars(bar_count=120)
+        for sym in self.official_symbols:
+            if sym in self.data_agents:
+                last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
+
     async def run(self):
         self.logger.info("Supervisor swarm initiated...")
 
@@ -524,21 +562,12 @@ class SupervisorAgent:
                     self._session_opening_balance = None
                     # Reset tick timestamp so the 90s/300s data stall watchdog doesn't fire immediately
                     self.client.last_tick_at = time.time()
-                    # Check for front-month contract rollover when flat
-                    for base_sym, old_off in list(getattr(self, "symbol_map", {}).items()):
-                        if not self.active_positions.get(old_off):
-                            try:
-                                new_off = await self.loop.run_in_executor(None, self.client.resolve_symbol, base_sym)
-                                if new_off and new_off != old_off:
-                                    self.logger.warning(f"[CONTRACT ROLLOVER] {base_sym} rolled from {old_off} -> {new_off}")
-                            except Exception as roll_exc:
-                                self.logger.debug(f"Rollover check skipped for {base_sym}: {roll_exc}")
-                    await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
-                    self.client.subscribe_market_data(self.official_symbols)
-                    await self._smart_sleep(3)
-                    await self._refresh_recent_bars(bar_count=120)
-                    for sym in self.official_symbols:
-                        last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
+                    if getattr(self, "_preopen_streams_ready", False) and self.client.is_connected and self.client.user_is_connected:
+                        self.logger.info("Pre-open SignalR streams already connected — skipping reconnect to preserve 18:00 ET opening bar.")
+                        self._preopen_streams_ready = False
+                    else:
+                        self._preopen_streams_ready = False
+                        await self._prepare_session_open_streams(last_processed_bar_count)
                     try:
                         acc_status = await self.loop.run_in_executor(None, self.client.get_account_status)
                         if acc_status:
@@ -582,17 +611,21 @@ class SupervisorAgent:
                     await self._smart_sleep(60)
                     continue
 
-                # If market is closed, shut down streaming to avoid noise
+                # If market is closed, shut down streaming to avoid noise (except during 2m pre-open warm-up)
                 if not market_open:
+                    secs_to_open = self._seconds_until_next_globex_open(now_dt)
+                    in_preopen_window = secs_to_open is not None and 0.0 < secs_to_open <= 120.0
+
                     # Flush any open 16:59 ET bars before shutting down streams
                     for sym in self.official_symbols:
                         if sym in self.data_agents:
                             self.data_agents[sym].check_bar_expiry(now_dt)
                             last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
-                    if self.client.is_connected or self.client.user_is_connected:
+                    if not in_preopen_window and (self.client.is_connected or self.client.user_is_connected):
                         self.logger.info("Market is closed: Shutting down SignalR streaming.")
                         self.client.stop_streaming()
                         self.client.stop_user_streaming()
+                        self._preopen_streams_ready = False
                     self._eod_triggered = False
 
                     # SESSION BOUNDARY RESET (fires once per maintenance window)
@@ -614,10 +647,24 @@ class SupervisorAgent:
                         self.risk_agent.reset_session()
                         self._session_reset_done = True
 
+                    # Pre-connect SignalR 2 minutes before 18:00 ET Globex open so the
+                    # opening minute bar (18:00-18:01 ET) is captured without reconnect gaps.
+                    if in_preopen_window and not getattr(self, "_preopen_streams_ready", False):
+                        self.logger.info("Pre-open warm-up (2m before 18:00 ET Globex): connecting SignalR streams...")
+                        await self._prepare_session_open_streams(last_processed_bar_count)
+                        self._preopen_streams_ready = True
+
                     # Autonomous Saturday Optimization Routine (runs on Saturday morning when flat)
                     await self._check_saturday_optimization()
 
-                    await self._smart_sleep(60)
+                    if secs_to_open is not None:
+                        if in_preopen_window:
+                            sleep_secs = min(5.0, max(0.5, secs_to_open))
+                        else:
+                            sleep_secs = min(60.0, max(1.0, secs_to_open - 120.0))
+                    else:
+                        sleep_secs = 60.0
+                    await self._smart_sleep(sleep_secs)
                     continue
 
                 # Ensure streams are active during market hours
@@ -663,7 +710,7 @@ class SupervisorAgent:
 
                 now_dt = datetime.now(timezone.utc)
                 for sym in self.official_symbols:
-                    self.data_agents[sym].check_bar_expiry(now_dt)
+                    self.data_agents[sym].check_bar_expiry(now_dt, grace_seconds=2.0)
                     current_bar_count = self.data_agents[sym].get_bar_count()
                     if current_bar_count <= last_processed_bar_count[sym]:
                         continue
