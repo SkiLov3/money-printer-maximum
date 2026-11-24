@@ -231,16 +231,16 @@ class RiskAgent:
             f"from contract metadata, symbol brackets, or exchange specifications."
         )
 
-    def get_entry_quantity(self, symbol, requested_qty, sl_ticks=None, current_price=None, current_atr=None):
+    def get_entry_quantity(self, symbol, requested_qty, sl_ticks=None, current_price=None, current_atr=None, atr_scaled_sl: bool = False):
         """Compute quantity using instrument-aware sizing when enabled, else fallback to legacy heuristics."""
         if self.feature_flags.get("instrument_sizing_enabled", False):
-            sized_qty = self.calculate_instrument_quantity(symbol, sl_ticks=sl_ticks, current_atr=current_atr)
+            sized_qty = self.calculate_instrument_quantity(symbol, sl_ticks=sl_ticks, current_atr=current_atr, atr_scaled_sl=atr_scaled_sl)
             if sized_qty <= 0:
                 return 0
-            return min(self.get_dynamic_quantity(symbol, sized_qty), sized_qty)
+            return min(self.get_dynamic_quantity(symbol, sized_qty, allow_upscale=False), sized_qty)
         return self.get_dynamic_quantity(symbol, requested_qty)
 
-    def calculate_instrument_quantity(self, symbol, sl_ticks=None, risk_pct=None, current_atr=None):
+    def calculate_instrument_quantity(self, symbol, sl_ticks=None, risk_pct=None, current_atr=None, atr_scaled_sl: bool = False):
         """Size by risk budget / stop cost per contract. Returns 0 when a single contract would over-risk."""
         with self._lock:
             sl_ticks = int(sl_ticks or 0)
@@ -269,7 +269,8 @@ class RiskAgent:
             risk_budget = base_risk_budget
 
             # Apply dynamic volatility adjustment if enabled and current_atr is provided
-            if self.feature_flags.get("volatility_sizing_enabled", False) and current_atr is not None and current_atr > 0:
+            # Skip if atr_scaled_sl is True to avoid double-penalization.
+            if not atr_scaled_sl and self.feature_flags.get("volatility_sizing_enabled", False) and current_atr is not None and current_atr > 0:
                 base_sym = self._extract_base(symbol)
                 bracket = self.symbol_brackets.get(base_sym)
                 if bracket and "min_atr" in bracket and "max_atr" in bracket:
@@ -302,7 +303,7 @@ class RiskAgent:
             contracts = int(risk_budget / contract_risk)
             return max(0, contracts)
 
-    def get_dynamic_quantity(self, symbol, requested_qty):
+    def get_dynamic_quantity(self, symbol, requested_qty, allow_upscale: bool = True):
         """Adjusts quantity based on daily performance (Defense-first, but reward streaks)."""
         with self._lock:
             if requested_qty <= 0:
@@ -338,14 +339,15 @@ class RiskAgent:
             # 3. ALPHA SCALING: Reward winning streaks with modest size increase.
             # Capped at 1.5x (not 2x) to avoid doubling the risk budget from instrument sizing.
             final_qty = requested_qty
-            sym_results = self.recent_trade_results.get(symbol) or self.recent_trade_results.get("GLOBAL", [])
-            if len(sym_results) >= 3:
-                if sum(sym_results[-3:]) > 0:
-                    if self.current_daily_pnl > 0:
-                        scaled = int(requested_qty * 1.5)
-                        if scaled > requested_qty:
-                            self.logger.info(f"Winning streak detected for {symbol}. Scaling {requested_qty} -> {scaled} (1.5x cap).")
-                            final_qty = scaled
+            if allow_upscale:
+                sym_results = self.recent_trade_results.get(symbol) or self.recent_trade_results.get("GLOBAL", [])
+                if len(sym_results) >= 3:
+                    if sum(sym_results[-3:]) > 0:
+                        if self.current_daily_pnl > 0:
+                            scaled = int(requested_qty * 1.5)
+                            if scaled > requested_qty:
+                                self.logger.info(f"Winning streak detected for {symbol}. Scaling {requested_qty} -> {scaled} (1.5x cap).")
+                                final_qty = scaled
 
             return max(0, min(final_qty, headroom_for_symbol))
 

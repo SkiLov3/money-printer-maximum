@@ -10,9 +10,12 @@ ENV VARS:
   DASHBOARD_PASSWORD  Set this on a public droplet! Browser will prompt for password.
 """
 import base64
+import contextlib
 import json
 import logging
 import os
+import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("dashboard")
+_ENV_WRITE_LOCK = threading.Lock()
 
 STATUS_FILE = Path("logs/bot_status.json")
 try:
@@ -1451,33 +1455,64 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length > 8192:
+                    self.send_response(413)
+                    self.end_headers()
+                    self.wfile.write(b"Payload too large")
+                    return
+                if content_length < 0:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Invalid Content-Length")
+                    return
+
                 raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
                 payload = json.loads(raw.decode("utf-8"))
 
                 new_dll = payload.get("max_daily_loss")
                 if new_dll is not None:
                     import math
+                    import re
+                    from decimal import Decimal
+
                     val_float = float(new_dll)
                     if not math.isfinite(val_float) or val_float < 50.0 or val_float > 100000.0:
                         raise ValueError("max_daily_loss must be between 50 and 100000")
-                    # Update active memory
-                    from decimal import Decimal
+
+                    # Update active memory with lock
                     val = Decimal(str(val_float))
-                    self.supervisor.risk_agent.max_daily_loss = val
+                    risk_agent = self.supervisor.risk_agent
+                    lock = getattr(risk_agent, "_lock", contextlib.nullcontext())
+                    with lock:
+                        risk_agent.max_daily_loss = val
+
                     val_str = str(int(val_float)) if val_float.is_integer() else str(val_float)
 
-                    # Persist to .env
-                    import re
+                    # Persist to .env atomically using a module-level lock
                     env_path = ".env"
-                    if os.path.exists(env_path):
-                        with open(env_path) as f:
-                            content = f.read()
-                        if "MAX_DAILY_LOSS" in content:
-                            content = re.sub(r"MAX_DAILY_LOSS=.*", f"MAX_DAILY_LOSS={val_str}", content)
-                        else:
-                            content += f"\nMAX_DAILY_LOSS={val_str}\n"
-                        with open(env_path, 'w') as f:
-                            f.write(content)
+                    with _ENV_WRITE_LOCK:
+                        if os.path.exists(env_path):
+                            with open(env_path, encoding="utf-8") as f:
+                                content = f.read()
+
+                            if "MAX_DAILY_LOSS" in content:
+                                content = re.sub(r"MAX_DAILY_LOSS=.*", f"MAX_DAILY_LOSS={val_str}", content)
+                            else:
+                                content = content.rstrip() + f"\nMAX_DAILY_LOSS={val_str}\n"
+
+                            dir_name = os.path.dirname(os.path.abspath(env_path))
+                            temp_name = None
+                            try:
+                                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dir_name, delete=False) as tf:
+                                    tf.write(content)
+                                    temp_name = tf.name
+                                os.chmod(temp_name, os.stat(env_path).st_mode)
+                                os.replace(temp_name, env_path)
+                            except Exception:
+                                if temp_name and os.path.exists(temp_name):
+                                    with contextlib.suppress(OSError):
+                                        os.unlink(temp_name)
+                                raise
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

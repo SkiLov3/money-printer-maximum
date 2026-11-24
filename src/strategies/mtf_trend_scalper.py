@@ -37,6 +37,7 @@ class MTFTrendScalperStrategy(BaseStrategy):
         self.max_stop_ticks = int(self.params.get("max_stop_ticks", 80))
         self.allowed_entry_hours_et = self.params.get("allowed_entry_hours_et", [9, 10, 11, 12, 13, 14, 15])
         self.allowed_sides = [str(s).lower() for s in self.params.get("allowed_sides", ["buy", "sell"])]
+        self.min_htf_bars = int(self.params.get("min_htf_bars", 15))
         self.skip_open_minutes = int(self.params.get("skip_open_minutes", 5))
         self.skip_close_minutes = int(self.params.get("skip_close_minutes", 15))
         self._last_signal_index: Any = None
@@ -189,7 +190,7 @@ class MTFTrendScalperStrategy(BaseStrategy):
             "close": "last"
         }).dropna()
 
-        if len(df_htf) < 15:
+        if len(df_htf) < self.min_htf_bars:
             return None
 
         df_htf = df_htf.assign(
@@ -234,8 +235,8 @@ class MTFTrendScalperStrategy(BaseStrategy):
             tr_s = tr.ewm(alpha=1 / 14, adjust=False).mean()
             pdm_s = pd.Series(plus_dm, index=df_ltf.index).ewm(alpha=1 / 14, adjust=False).mean()
             mdm_s = pd.Series(minus_dm, index=df_ltf.index).ewm(alpha=1 / 14, adjust=False).mean()
-            plus_di = 100 * (pdm_s / (tr_s + 1e-9))
-            minus_di = 100 * (mdm_s / (tr_s + 1e-9))
+            plus_di = pd.Series(100 * (pdm_s / (tr_s + 1e-9)))
+            minus_di = pd.Series(100 * (mdm_s / (tr_s + 1e-9)))
             dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
             df_ltf = df_ltf.assign(adx=dx.ewm(alpha=1 / 14, adjust=False).mean())
 
@@ -246,6 +247,9 @@ class MTFTrendScalperStrategy(BaseStrategy):
             # Guard against evaluating the skipped 09:30-09:34 opening bar when clock reaches 09:35
             try:
                 ltf_et = ltf_bar_ts.tz_convert("America/New_York")
+                if self.allowed_entry_hours_et and ltf_et.hour not in self.allowed_entry_hours_et:
+                    self._last_evaluated_ltf_ts = ltf_bar_ts
+                    return None
                 if self.skip_open_minutes > 0 and ltf_et.hour == 9 and 30 <= ltf_et.minute < (30 + self.skip_open_minutes):
                     self._last_evaluated_ltf_ts = ltf_bar_ts
                     return None
@@ -265,7 +269,24 @@ class MTFTrendScalperStrategy(BaseStrategy):
             high_eval = float(ltf_last["high"])
             low_eval = float(ltf_last["low"])
             ema21_eval = float(ltf_last["ema_21"])
-            vwap_eval = float(row.get("vwap", close_eval))
+
+            # Align VWAP to the evaluated LTF bar when using -2 lookback
+            if ltf_idx == -2 and "vwap" in indicators.columns:
+                try:
+                    ltf_end_ts = ltf_bar_ts + pd.Timedelta(minutes=self.ltf_minutes)
+                    vwap_slice = indicators.iloc[lookback_1m : index + 1]
+                    vwap_ts = pd.to_datetime(vwap_slice["timestamp"], utc=True)
+                    mask = (vwap_ts >= ltf_bar_ts) & (vwap_ts < ltf_end_ts)
+                    valid_vwaps = vwap_slice.loc[mask, "vwap"].dropna()
+                    if not valid_vwaps.empty:
+                        vwap_eval = float(valid_vwaps.iloc[-1])
+                    else:
+                        vwap_eval = float(row.get("vwap", close_eval))
+                except Exception:
+                    vwap_eval = float(row.get("vwap", close_eval))
+            else:
+                vwap_eval = float(row.get("vwap", close_eval))
+
             signal_key = ltf_bar_ts
         else:
             if self._last_signal_index == index:
@@ -286,7 +307,7 @@ class MTFTrendScalperStrategy(BaseStrategy):
         # Calculate ATR-based Stop & Target in Ticks with float precision rounding
         stop_ticks = max(self.min_stop_ticks, min(self.max_stop_ticks, int(math.ceil(round((self.sl_atr_mult * atr) / self.tick_size, 4)))))
         rr = self.tp_atr_mult / max(self.sl_atr_mult, 1e-9)
-        target_ticks = max(stop_ticks * 2, int(round(stop_ticks * rr)))
+        target_ticks = max(1, int(round(stop_ticks * rr)))
 
         raw_1m_atr = float(row.get("atr", 0.0) or 0.0)
         atr_1m = raw_1m_atr if (not math.isnan(raw_1m_atr) and raw_1m_atr > 0) else atr

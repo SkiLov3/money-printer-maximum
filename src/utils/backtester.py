@@ -26,8 +26,8 @@ class _BacktestExecutionAgent:
 class Backtester:
     SIGNAL_COOLDOWN_SECONDS = 300
     WIN_COOLDOWN_SECONDS = 120
-    LOSS_COOLDOWN_SECONDS = 600
-    STREAK_COOLDOWN_SECONDS = 1800
+    LOSS_COOLDOWN_SECONDS = 1800
+    STREAK_COOLDOWN_SECONDS = 3600
 
     def __init__(
         self,
@@ -310,6 +310,13 @@ class Backtester:
         }
         routed = self._route_signal(signal, route_context)
         if isinstance(routed, RouterRejection):
+            eng = getattr(getattr(self, "strategy", None), "engine", None)
+            for strat in (getattr(eng, "strategies", None) or []):
+                if getattr(strat, "name", None) == signal.get("strategy_name"):
+                    hook = getattr(strat, "on_signal_rejected", None)
+                    if callable(hook):
+                        hook(signal)
+
             self.telemetry.record_signal(
                 self.symbol,
                 signal["strategy_name"],
@@ -372,6 +379,7 @@ class Backtester:
             sl_ticks=signal.get("sl_ticks"),
             current_price=route_context.get("current_price"),
             current_atr=metadata.get("atr"),
+            atr_scaled_sl=bool(metadata.get("atr_scaled_sl", False)),
         )
         if quantity <= 0:
             return RouterRejection("quantity sizing returned 0", "size")
@@ -417,17 +425,17 @@ class Backtester:
         if stop_price is not None and not pd.isna(stop_price):
             stop_price = float(stop_price)
             if signal["side"] == "Buy" and stop_price < entry_price:
-                sl_ticks = max(1, int(np.ceil((entry_price - stop_price) / self.tick_size)))
+                sl_ticks = max(1, int(np.ceil(round((entry_price - stop_price) / self.tick_size, 6))))
             elif signal["side"] == "Sell" and stop_price > entry_price:
-                sl_ticks = max(1, int(np.ceil((stop_price - entry_price) / self.tick_size)))
+                sl_ticks = max(1, int(np.ceil(round((stop_price - entry_price) / self.tick_size, 6))))
         target_price = metadata.get("target_price")
         target_r_multiple = metadata.get("target_r_multiple")
         if target_price is not None and not pd.isna(target_price):
             target_price = float(target_price)
             if signal["side"] == "Buy" and target_price > entry_price:
-                tp_ticks = max(1, int(np.floor((target_price - entry_price) / self.tick_size)))
+                tp_ticks = max(1, int(np.floor(round((target_price - entry_price) / self.tick_size, 6))))
             elif signal["side"] == "Sell" and target_price < entry_price:
-                tp_ticks = max(1, int(np.floor((entry_price - target_price) / self.tick_size)))
+                tp_ticks = max(1, int(np.floor(round((entry_price - target_price) / self.tick_size, 6))))
         elif target_r_multiple is not None and not pd.isna(target_r_multiple):
             tp_ticks = max(1, round(sl_ticks * float(target_r_multiple)))
 
@@ -478,7 +486,7 @@ class Backtester:
         to_remove = []
         operational_filters_enabled = self.routing_mode not in ("optimizer_search", "optimizer_fast")
         news_event = operational_filters_enabled and self.news_agent.is_news_approaching(timestamp, lead_minutes=2)
-        eod_flatten = operational_filters_enabled and self.news_agent.is_near_close(timestamp, lead_minutes=0)
+        eod_flatten = operational_filters_enabled and self.news_agent.is_near_close(timestamp, lead_minutes=15)
 
         for trade in self.active_trades:
             if trade.pop("pending_daily_profit_lock_exit", False):

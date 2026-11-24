@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -76,6 +77,7 @@ class SupervisorAgent:
         self.client = ProjectXClient()
         if self.account_id and str(self.account_id).isdigit():
             self.client.account_id = int(self.account_id)
+        self.client._last_stop_coverage = {}
         self.risk_agent = RiskAgent(account_id)
         self.execution_agent = ExecutionAgent(self.client)
         self.news_agent = NewsAgent()
@@ -329,6 +331,8 @@ class SupervisorAgent:
             status = self.client.get_account_status()
             if status:
                 balance = status.get("balance", 0)
+                if self._session_opening_balance is not None and float(self._session_opening_balance) > 0 and balance:
+                    self._session_pnl_from_fills = float(Decimal(str(balance)) - self._session_opening_balance)
                 pnl = status.get("dailyPnL")  # None when absent — preserves fill-accumulated P&L
                 mll = status.get("minimumBalance")
                 self.risk_agent.update_account_state(
@@ -605,6 +609,7 @@ class SupervisorAgent:
                             mll_val = acc_status.get("minimumBalance")
                             if cur_bal and float(cur_bal) > 0:
                                 self._session_opening_balance = Decimal(str(cur_bal))
+                                self._session_pnl_from_fills = float(Decimal(str(cur_bal)) - self._session_opening_balance)
                             self.risk_agent.update_account_state(
                                 cur_bal, pnl_val, 0, minimum_balance=mll_val, session_opening_balance=self._session_opening_balance
                             )
@@ -623,12 +628,6 @@ class SupervisorAgent:
                 if now_ts - self._last_status_write >= status_interval:
                     self._schedule_status_write()
                     self._last_status_write = now_ts
-
-                # RISK HALT: If daily loss/drawdown limit was previously hit this session,
-                # skip all analysis and trade dispatch — bot is halted for the day.
-                if self._risk_halt:
-                    await self._smart_sleep(30)
-                    continue
 
                 # EOD HARD STOP CHECK (4:50 PM ET) — runs BEFORE the market-closed gate
                 # so that the flatten fires even though is_market_hours returns False at 16:50.
@@ -696,6 +695,12 @@ class SupervisorAgent:
                     await self._smart_sleep(sleep_secs)
                     continue
 
+                # RISK HALT: If daily loss/drawdown limit was previously hit this session,
+                # skip all analysis and trade dispatch — bot is halted for the day.
+                if self._risk_halt:
+                    await self._smart_sleep(30)
+                    continue
+
                 # Ensure streams are active during market hours (exponential backoff prevents auth/429 storms)
                 if not self.client.is_connected or not self.client.user_is_connected:
                     if now_ts >= getattr(self, "_next_reconnect_at", 0.0):
@@ -734,6 +739,8 @@ class SupervisorAgent:
                     status = await self.loop.run_in_executor(None, self.client.get_account_status)
                     if status:
                         balance = status.get("balance", 0)
+                        if self._session_opening_balance is not None and float(self._session_opening_balance) > 0:
+                            self._session_pnl_from_fills = float(Decimal(str(balance)) - self._session_opening_balance)
                         pnl = status.get("dailyPnL")  # None when absent — preserves fill-accumulated P&L
                         mll = status.get("minimumBalance")
                         async with self._lock:
@@ -1495,6 +1502,12 @@ class SupervisorAgent:
             if isinstance(result, RouterRejection):
                 self.health_monitor.record_signal(sym, False, result.reason)
                 self.logger.info(f"[ROUTER REJECT] {sym}: {result.stage} {result.reason}")
+
+                strategy_agent = self.strategy_agents.get(sym)
+                engine = getattr(strategy_agent, "engine", None)
+                for strat in getattr(engine, "strategies", None) or []:
+                    if getattr(strat, "name", None) == trade_intent.get("strategy_name") and callable(getattr(strat, "on_signal_rejected", None)):
+                        strat.on_signal_rejected(trade_intent)
                 return
 
             self.health_monitor.record_signal(sym, True, result.reason)
@@ -2440,6 +2453,10 @@ class SupervisorAgent:
                 has_stop = await self.loop.run_in_executor(None, self.client.has_working_stop_order, symbol, side, qty)
             except TypeError:
                 has_stop = await self.loop.run_in_executor(None, self.client.has_working_stop_order, symbol, side)
+
+            pos_side_norm = str(side).strip().lower()
+            covered_qty = int(getattr(self.client, "_last_stop_coverage", {}).pop((symbol, pos_side_norm), 0) or 0)
+
             if has_stop is True:
                 async with self._lock:
                     if hasattr(self, "_stop_placement_in_flight"):
@@ -2520,9 +2537,10 @@ class SupervisorAgent:
                 await self.loop.run_in_executor(None, self.execution_agent.flatten_position, symbol, qty, side)
                 return True
 
+            place_qty = (qty - covered_qty) if (0 < covered_qty < qty) else qty
             self.logger.critical(
                 f"[BRACKET GUARD] ⚠️ UNPROTECTED POSITION DETECTED! {symbol} {side} {qty}x @ {entry_p} has NO active stop-loss! "
-                f"Placing emergency protective stop: {stop_side} {qty}x Stop @ {stop_price} ({effective_sl_ticks} ticks)..."
+                f"Placing emergency protective stop: {stop_side} {place_qty}x Stop @ {stop_price} ({effective_sl_ticks} ticks)..."
             )
 
             exec_agent = getattr(self, "execution_agent", None)
@@ -2540,7 +2558,7 @@ class SupervisorAgent:
                 None,
                 self.client.place_order,
                 symbol,
-                qty,
+                place_qty,
                 stop_side,
                 "Stop",
                 None,  # limit_price
@@ -2559,7 +2577,7 @@ class SupervisorAgent:
                     self._stop_placement_in_flight[symbol] = time.time()
 
             self.logger.warning(
-                f"[BRACKET GUARD] ✅ Emergency protective stop placed for {symbol}: {stop_side} {qty}x Stop @ {stop_price} (res={res})"
+                f"[BRACKET GUARD] ✅ Emergency protective stop placed for {symbol}: {stop_side} {place_qty}x Stop @ {stop_price} (res={res})"
             )
             return True
         except Exception as e:
@@ -2980,11 +2998,41 @@ class SupervisorAgent:
             curr_price = latest_bar.iloc[-1]["close"]
             tick_size = self.risk_agent.get_tick_size(sym)
             for pos in positions:
+                if pos.get("news_be_moved"):
+                    continue
                 side, entry, qty = pos["side"], pos["entry"], pos["qty"]
                 points_profit = (curr_price - entry) if side == "Buy" else (entry - curr_price)
                 ticks_profit = round(points_profit / tick_size)
                 if ticks_profit > 30:
-                    self.logger.info(f"[PRO-GUARD] Moving {sym} {side} to BE for {news_event}")
+                    exec_mode = getattr(getattr(self, "execution_agent", None), "mode", None) or os.getenv("MODE", "simulation").strip().lower()
+                    live_switch = os.getenv("ACTUAL_LIVE_TRADING", "false").strip().lower() == "true"
+                    use_brackets = os.getenv("USE_ORDER_BRACKETS", "true").strip().lower() == "true"
+
+                    if exec_mode == "live" and live_switch and use_brackets:
+                        stop_side = "Sell" if str(side).strip().lower() in ("buy", "long", "0") else "Buy"
+                        ts_str = f"{tick_size:.6f}".rstrip("0")
+                        prec = len(ts_str.split(".")[1]) if "." in ts_str else 0
+                        be_price = round(round(float(entry) / tick_size) * tick_size, prec)
+
+                        await self.loop.run_in_executor(None, self.client.cancel_open_orders_for_symbol, sym)
+                        res = await self.loop.run_in_executor(None, self.client.place_order, sym, qty, stop_side, "Stop", None, be_price)
+
+                        if isinstance(res, dict) and (res.get("status") in ("error", "rejected") or res.get("success") is False):
+                            self.logger.error(f"[PRO-GUARD] BE move failed for {sym}, flattening: {res}")
+                            self._close_in_flight[sym] = True
+                            self._close_in_flight_since[sym] = time.time()
+                            flat_res = await self.loop.run_in_executor(None, self.execution_agent.flatten_position, sym, qty, side)
+                            if flat_res and flat_res.get("status") in ("error", "rejected"):
+                                self._close_in_flight.pop(sym, None)
+                                self._close_in_flight_since.pop(sym, None)
+                        else:
+                            async with self._lock:
+                                pos["news_be_moved"] = True
+                            self.logger.info(f"[PRO-GUARD] Successfully moved {sym} {side} to BE for {news_event}")
+                    else:
+                        self.logger.info(f"[PRO-GUARD] Moving {sym} {side} to BE for {news_event} (simulated/non-API brackets)")
+                        async with self._lock:
+                            pos["news_be_moved"] = True
                 else:
                     self.logger.warning(f"[PRO-GUARD] Flattening {sym} {side} {qty}x before {news_event}")
                     self._close_in_flight[sym] = True
@@ -3590,6 +3638,7 @@ class SupervisorAgent:
                 return False
             self.stack_config = load_stack_config()
             self.strategy_config = get_strategy_config(self.stack_config)
+            self.feature_flags = get_feature_flags(self.stack_config)
             self.routing_config = get_routing_config(self.stack_config)
             self.filter_manager = FilterManager(self.routing_config)
             self.trade_router = TradeRouter(
@@ -3598,8 +3647,21 @@ class SupervisorAgent:
                 telemetry=self.telemetry,
                 filter_manager=self.filter_manager,
             )
-            if hasattr(self, "risk_agent") and self.risk_agent is not None and "symbol_brackets" in self.stack_config:
-                self.risk_agent.symbol_brackets = self.stack_config.get("symbol_brackets", {})
+            if hasattr(self, "risk_agent") and self.risk_agent is not None:
+                from src.config.settings import get_commissions_config
+                lock = getattr(self.risk_agent, "_lock", None)
+                with lock if lock is not None else contextlib.nullcontext():
+                    self.risk_agent.stack_config = self.stack_config
+                    self.risk_agent.symbol_brackets = get_symbol_brackets(self.stack_config)
+                    self.risk_agent.routing_config = self.routing_config
+                    self.risk_agent.feature_flags = self.feature_flags
+                    self.risk_agent.commissions_config = get_commissions_config(self.stack_config)
+                    target_raw = self.risk_agent.routing_config.get("daily_profit_target")
+                    self.risk_agent.daily_profit_target = Decimal(str(target_raw)) if target_raw not in (None, "") else None
+                    loss_raw = self.risk_agent.routing_config.get("daily_loss_halt")
+                    self.risk_agent.daily_loss_halt = Decimal(str(loss_raw)) if loss_raw not in (None, "") else None
+                    self.risk_agent.max_consecutive_losses = int(self.risk_agent.routing_config.get("max_consecutive_losses", 2))
+
             for official in self.official_symbols:
                 if official in self.strategy_agents:
                     try:

@@ -242,11 +242,28 @@ class ORBVWAPStrategy(BaseStrategy):
             return None
         return int(round((self._asian_or_high - self._asian_or_low) / self.tick_size))
 
-    def _volume_ratio(self, index: int, bars: pd.DataFrame) -> float | None:
+    def _volume_ratio(self, index: int, bars: pd.DataFrame, asian_session_key: str | None = None) -> float | None:
         if self.volume_lookback_bars <= 0 or "volume" not in bars.columns:
             return None
         start = max(0, index - self.volume_lookback_bars)
-        history = bars.iloc[start:index]["volume"].astype(float)
+        window_df = bars.iloc[start:index]
+
+        if asian_session_key and "timestamp" in window_df.columns:
+            # Filter rows in window_df where bar_et is in the same asian session
+            # We use _timestamp_et and _asian_session_for_timestamp
+            def is_same_session(ts):
+                et = self._timestamp_et(ts)
+                return et is not None and self._asian_session_for_timestamp(et) == asian_session_key
+
+            mask = window_df["timestamp"].apply(is_same_session)
+            session_bars = window_df[mask]
+            if len(session_bars) >= 3:
+                history = session_bars["volume"].astype(float)
+            else:
+                history = window_df["volume"].astype(float)
+        else:
+            history = window_df["volume"].astype(float)
+
         if history.empty:
             return None
         avg_volume = float(history.mean())
@@ -303,12 +320,31 @@ class ORBVWAPStrategy(BaseStrategy):
                 return "Sell", "breakout", "Opening range breakout below low"
 
         if direction_mode in {"fade", "both"}:
-            if low < or_low - breakout_buffer and close > or_low + fade_reclaim:
+            buy_fade = low < or_low - breakout_buffer and close > or_low + fade_reclaim
+            sell_fade = high > or_high + breakout_buffer and close < or_high - fade_reclaim
+            if buy_fade and sell_fade:
+                open_p = float(row.get("open", close))
+                if close > open_p:
+                    return "Buy", "fade", "Opening range low reclaim fade"
+                if close < open_p:
+                    return "Sell", "fade", "Opening range high rejection fade"
+                return None, None, None
+            if buy_fade:
                 return "Buy", "fade", "Opening range low reclaim fade"
-            if high > or_high + breakout_buffer and close < or_high - fade_reclaim:
+            if sell_fade:
                 return "Sell", "fade", "Opening range high rejection fade"
 
         return None, None, None
+
+    def on_signal_rejected(self, signal):
+        """Hook called when a signal is rejected downstream (e.g. by direction filters)."""
+        metadata = (signal.metadata if hasattr(signal, "metadata") else signal.get("metadata")) or {}
+        session_window = metadata.get("session_window")
+        session_key = metadata.get("session")
+        if session_window == "NY" and self._fired_session == session_key:
+            self._fired_session = None
+        if session_window == "ASIAN" and self._asian_fired_session == session_key:
+            self._asian_fired_session = None
 
     # ── Snapshot ──
 
@@ -511,7 +547,7 @@ class ORBVWAPStrategy(BaseStrategy):
         if side is None:
             return None
 
-        volume_ratio = self._volume_ratio(index, bars)
+        volume_ratio = self._volume_ratio(index, bars, asian_session_key=asian_key)
         if self.asian_min_volume_ratio > 0 and volume_ratio is not None and volume_ratio < self.asian_min_volume_ratio:
             self._asian_last_reject_reason = "asian volume ratio below threshold"
             return None

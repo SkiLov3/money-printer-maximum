@@ -58,18 +58,18 @@ class ExecutionAgent:
                                 sp_f = float(sp)
                                 if math.isfinite(sp_f):
                                     if is_buy and sp_f < ep:
-                                        sl_ticks = max(1, int(math.ceil((ep - sp_f) / tick_sz)))
+                                        sl_ticks = max(1, int(math.ceil(round((ep - sp_f) / tick_sz, 6))))
                                     elif is_sell and sp_f > ep:
-                                        sl_ticks = max(1, int(math.ceil((sp_f - ep) / tick_sz)))
+                                        sl_ticks = max(1, int(math.ceil(round((sp_f - ep) / tick_sz, 6))))
                             tp = metadata.get("target_price")
                             tr_mult = metadata.get("target_r_multiple")
                             if tp is not None:
                                 tp_f = float(tp)
                                 if math.isfinite(tp_f):
                                     if is_buy and tp_f > ep:
-                                        tp_ticks = max(1, int(math.floor((tp_f - ep) / tick_sz)))
+                                        tp_ticks = max(1, int(math.floor(round((tp_f - ep) / tick_sz, 6))))
                                     elif is_sell and tp_f < ep:
-                                        tp_ticks = max(1, int(math.floor((ep - tp_f) / tick_sz)))
+                                        tp_ticks = max(1, int(math.floor(round((ep - tp_f) / tick_sz, 6))))
                             elif tr_mult is not None and sl_ticks:
                                 tr_f = float(tr_mult)
                                 if math.isfinite(tr_f) and tr_f > 0:

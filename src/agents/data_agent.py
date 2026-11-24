@@ -51,7 +51,7 @@ class DataAgent:
         self.symbol = symbol
         self.logger = logging.getLogger(f"DataAgent-{symbol}")
         self.lock = threading.RLock()
-        
+
         # Completed OHLCV bars for the strategy
         # FIX: Explicitly set dtypes to avoid 'object' type issues during math/indicators
         self.bars: pd.DataFrame = pd.DataFrame({
@@ -64,7 +64,7 @@ class DataAgent:
             'price': pd.Series(dtype='float64')
         })
         self.max_bars = int(max_bars or 12000)  # Enough 1m history for higher-timeframe learning review.
-        
+
         # Current bar being built from ticks
         self.bar_interval = bar_interval_seconds
         self.current_bar = None  # {open, high, low, close, volume, start_time}
@@ -130,7 +130,7 @@ class DataAgent:
             # so synthetic midpoints never pollute bar open/high/low/close.
             if data.get('is_trade') is False:
                 with self.lock:
-                    self.check_bar_expiry(tick_dt)
+                    self.check_bar_expiry(tick_dt, grace_seconds=0.5)
                 return
 
             # Bucket start_time strictly to the top of the calendar minute (e.g. 09:30:00)
@@ -182,9 +182,9 @@ class DataAgent:
                     self.current_bar['close'] = tick_price
                     self.current_bar['volume'] += tick_volume
                     self.tick_count += 1
-                    
+
                 self.logger.debug(f"Tick: {tick_price} (bar ticks: {self.tick_count})")
-                
+
         except Exception as e:
             self.logger.error(f"Error processing market data for {self.symbol}: {e}")
 
@@ -192,11 +192,11 @@ class DataAgent:
         """Checks if the current bar has expired based on time and closes it if so."""
         if now is None:
             now = datetime.now(timezone.utc).astimezone()
-        
+
         # FIX: Ensure 'now' is naive UTC for internal comparison and storage
         if hasattr(now, 'tzinfo') and now.tzinfo is not None:
             now = now.astimezone(timezone.utc).replace(tzinfo=None)
-            
+
         with self.lock:
             if self.current_bar:
                 elapsed = (now - self.current_bar['start_time']).total_seconds()
@@ -208,7 +208,7 @@ class DataAgent:
         """Closes the current bar and adds it to the bar history."""
         if self.current_bar is None:
             return
-        
+
         # FIX: Ensure timestamp being stored is naive
         start_time = self.current_bar['start_time']
         if hasattr(start_time, 'tzinfo') and start_time.tzinfo is not None:
@@ -223,9 +223,9 @@ class DataAgent:
             'volume': self.current_bar['volume'],
             'price': self.current_bar['close']  # Strategy uses 'price' column
         }
-        
+
         new_bar_df = pd.DataFrame([new_bar])
-        
+
         # FIX: Explicitly strip timezone from timestamp BEFORE astype()
         # This prevents the TypeError: Cannot use .astype to convert from aware to naive
         if 'timestamp' in new_bar_df.columns:
@@ -241,16 +241,16 @@ class DataAgent:
             pd.DataFrame,
             merged_df.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(drop=True),
         )
-        
+
         # Trim to max size
         if len(self.bars) > self.max_bars:
             self.bars = cast(pd.DataFrame, self.bars.iloc[-self.max_bars:].reset_index(drop=True))
-        
+
         self.logger.debug(
             f"Bar closed: O={new_bar['open']:.2f} H={new_bar['high']:.2f} "
             f"L={new_bar['low']:.2f} C={new_bar['close']:.2f} V={new_bar['volume']}"
         )
-        
+
         # Reset for next bar
         self._live_closed_timestamps.add(start_time)
         if len(self._live_closed_timestamps) > 2000:
@@ -297,7 +297,7 @@ class DataAgent:
             pd.DataFrame,
             combined.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True),
         )
-    
+
     def get_bar_count(self):
         """Returns the total number of bars generated across the lifetime of the agent."""
         with self.lock:
@@ -310,7 +310,7 @@ class DataAgent:
         """
         if not bars_data:
             return
-            
+
         new_rows = []
         for b in bars_data:
             # Map API fields to internal DataFrame format using flexible lookup
@@ -320,7 +320,7 @@ class DataAgent:
             # Map OHLCV with fallbacks for camelCase or short keys
             o = b.get('open') or b.get('openPrice') or b.get('o') or 0
             h = b.get('high') or b.get('highPrice') or b.get('h') or 0
-            l = b.get('low') or b.get('lowPrice') or b.get('l') or 0
+            lo = b.get('low') or b.get('lowPrice') or b.get('l') or 0
             c = b.get('close') or b.get('closePrice') or b.get('c') or 0
             v = b.get('volume') or b.get('v') or 0
 
@@ -328,15 +328,15 @@ class DataAgent:
                 'timestamp': ts,
                 'open': float(o),
                 'high': float(h),
-                'low': float(l),
+                'low': float(lo),
                 'close': float(c),
                 'volume': float(v),
                 'price': float(c)
             })
-            
+
         with self.lock:
             history_df = pd.DataFrame(new_rows)
-            
+
             # FIX: Explicitly strip timezone from timestamp BEFORE astype()
             if 'timestamp' in history_df.columns:
                 history_df.loc[:, 'timestamp'] = pd.to_datetime(history_df['timestamp']).dt.tz_localize(None)
@@ -350,7 +350,7 @@ class DataAgent:
             type_map = {col: self.bars[col].dtype for col in self.bars.columns if col in history_df.columns}
             if type_map and not history_df.empty:
                 history_df = history_df.astype(type_map)
-            
+
             existing_ts = set(self.bars['timestamp']) if not self.bars.empty else set()
             new_unique_count = sum(1 for ts in history_df['timestamp'] if ts not in existing_ts) if not history_df.empty else 0
 
@@ -368,5 +368,5 @@ class DataAgent:
                 getattr(self, "total_bars_generated", 0) + max(new_unique_count, 0),
                 len(self.bars),
             )
-                
+
         self.logger.info(f"Pre-loaded {len(new_rows)} historical bars into state.")

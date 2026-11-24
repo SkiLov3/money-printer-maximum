@@ -200,17 +200,17 @@ class StrategyEngine:
         accepted = None
         candidates = []
         candidate_signals = []
-        
+
         row = indicators.iloc[index]
         timestamp = row.get("timestamp")
         if timestamp is not None and self._last_processed_timestamp is not None and timestamp <= self._last_processed_timestamp:
             return None, []
-            
+
         price = float(row.get("close", row.get("price", 0)))
         self._last_candidates = []
         self._last_selected = None
         is_priming = any(getattr(s, "is_priming", False) for s in self.strategies)
-        
+
         for strategy in self.strategies:
             if not getattr(strategy, "enabled", True):
                 continue
@@ -218,6 +218,9 @@ class StrategyEngine:
             if signal is None:
                 continue
             if not self._apply_direction_filter(signal):
+                hook = getattr(strategy, "on_signal_rejected", None)
+                if callable(hook):
+                    hook(signal)
                 if not is_priming:
                     self.telemetry.record_signal(
                         self.symbol,
@@ -355,6 +358,23 @@ class StrategyEngine:
             self.prime(bars, indicators, last_idx - 1)
             start_idx = last_idx
 
+        # If start_idx < last_idx, we have multiple new bars (e.g. after a reconnect backfill).
+        # We prime intermediate bars [start_idx, last_idx - 1] to update strategy state
+        # without emitting phantom candidate/selected telemetry.
+        if start_idx < last_idx:
+            for strategy in self.strategies:
+                strategy.is_priming = True
+            try:
+                for idx in range(start_idx, last_idx):
+                    self.evaluate_index(bars, indicators, idx)
+                    row_ts = indicators.iloc[idx].get("timestamp")
+                    if row_ts is not None and not pd.isna(row_ts):
+                        self._last_processed_timestamp = row_ts
+            finally:
+                for strategy in self.strategies:
+                    strategy.is_priming = False
+            start_idx = last_idx
+
         for idx in range(start_idx, last_idx + 1):
             row_ts = indicators.iloc[idx].get("timestamp")
             if self._last_processed_timestamp is not None and row_ts is not None:
@@ -379,7 +399,7 @@ class StrategyEngine:
         index = len(indicators) - 1
         self._snapshot(bars, indicators, index)
         row = indicators.iloc[index]
-        
+
         # Helper to clean numeric values for JSON serialization
         def _c(v):
             import pandas as pd
@@ -439,7 +459,7 @@ class StrategyEngine:
         if not aggregate and self._last_snapshot:
             first_key = next(iter(self._last_snapshot))
             aggregate = copy.deepcopy(self._last_snapshot.get(first_key, {}))
-            
+
         # Merge global indicators so they are always present
         aggregate.update(global_indicators)
 

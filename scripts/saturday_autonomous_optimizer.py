@@ -116,6 +116,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
         "asian_stop_buffer_ticks": (0.0, 10.0),
         "asian_breakout_buffer_ticks": (0.0, 10.0),
         "asian_fade_reclaim_ticks": (0.0, 10.0),
+        "min_volume_ratio": (0.0, 3.0),
     },
 }
 

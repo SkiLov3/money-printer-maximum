@@ -137,6 +137,7 @@ class ProjectXClient:
         self.symbol_to_id_cache = {}  # Resolves 'NQM6' -> 'CON.F.US.ENQ.M26'
         self.contract_id_to_symbol = {}  # Reverse: 'CON.F.US.MES.Z26' -> 'MESZ6'
         self._last_contract_volume = {}  # Tracks cumulative session volume per contractId
+        self._last_stop_coverage: dict[tuple[str, str], int] = {}
         
         # DEVSEC FIX: Atomic Lock for thread-safe authentication
         import threading
@@ -461,7 +462,13 @@ class ProjectXClient:
             sym_aliases = dict(self.symbol_to_id_cache)
 
         active_orders = self.get_orders(active=True)
+        if not hasattr(self, "_last_stop_coverage"):
+            self._last_stop_coverage = {}
+
+        pos_side_norm = str(position_side).strip().lower()
+
         if active_orders is None:
+            self._last_stop_coverage.pop((symbol, pos_side_norm), None)
             self.logger.warning(f"Could not verify working stop orders for {symbol}: get_orders returned None.")
             return None
 
@@ -469,7 +476,6 @@ class ProjectXClient:
         # Expected stop order side: opposite of position side.
         # Long position (Buy) -> Stop order to exit is Sell (side 1).
         # Short position (Sell) -> Stop order to exit is Buy (side 0).
-        pos_side_norm = str(position_side).strip().lower()
         expected_stop_side_int = 1 if pos_side_norm in ("buy", "long", "0") else 0
 
         ACTIVE_STATUSES = {
@@ -534,13 +540,25 @@ class ProjectXClient:
                         has_unsized_stop = True
 
         if covered_qty >= max(1, int(min_qty)):
+            if not has_unsized_stop:
+                self._last_stop_coverage[(symbol, pos_side_norm)] = covered_qty
             return True
-        return bool(has_unsized_stop and covered_qty == 0)
+
+        if has_unsized_stop:
+            if covered_qty == 0:
+                self._last_stop_coverage.pop((symbol, pos_side_norm), None)
+                return True
+            self._last_stop_coverage[(symbol, pos_side_norm)] = covered_qty
+            return True
+
+        self._last_stop_coverage[(symbol, pos_side_norm)] = covered_qty
+        return False
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancels a single open order by ID via POST /Order/cancel.
         Returns True on success, False on failure.
         """
+
         if not self.account_id:
             return False
         url = f"{self.base_url}/Order/cancel"
@@ -913,11 +931,21 @@ class ProjectXClient:
                 prev_vol = self._last_contract_volume.get(cid_key)
                 if raw_vol > 0:
                     if prev_vol is not None:
-                        tick_vol = (raw_vol - prev_vol) if raw_vol >= prev_vol else raw_vol
+                        if raw_vol >= prev_vol:
+                            tick_vol = raw_vol - prev_vol
+                        elif raw_vol < prev_vol * 0.5:
+                            # Genuine session reset toward zero
+                            tick_vol = raw_vol
+                            if is_trade:
+                                self._last_contract_volume[cid_key] = raw_vol
+                        else:
+                            # Minor out-of-order regression, ignore
+                            tick_vol = 0.0
                     else:
                         # First tick seen for this contract: only use raw_vol directly if it's small (e.g. unit test / session start)
                         tick_vol = raw_vol if raw_vol <= 500 else 0.0
-                    if is_trade:
+                    
+                    if is_trade and (prev_vol is None or raw_vol >= prev_vol):
                         self._last_contract_volume[cid_key] = raw_vol
                 else:
                     tick_vol = 0.0
@@ -1463,7 +1491,7 @@ class ProjectXClient:
             payload = symbols if isinstance(symbols, list) else [symbols]
             for sym in payload:
                 self.active_subscriptions.add(sym)
-                
+
             if not self.is_connected or not self.connection:
                 self.logger.warning("SignalR not connected yet; market data subscriptions queued.")
                 return False
