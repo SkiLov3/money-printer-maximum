@@ -259,15 +259,15 @@ def test_stage_llama_redteam_api_failure_fallback_to_conservative_grid():
         assert "fallback" in audit.get("redteam_summary", "").lower()
 
 
-def test_call_llm_stage_enforces_root_keep_alive():
-    """Verifies that call_llm_stage places keep_alive at top level of request body per Ollama API spec."""
+def test_call_llm_stage_enforces_openai_chat_format():
+    """Verifies that call_llm_stage posts OpenAI-compatible messages to llama.cpp router."""
     captured_body = []
 
     def mock_urlopen(req, timeout=300):
         data = json.loads(req.data.decode("utf-8"))
         captured_body.append(data)
         resp = MagicMock()
-        resp.read.return_value = json.dumps({"message": {"content": "{}"}}).encode("utf-8")
+        resp.read.return_value = json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode("utf-8")
         cm = MagicMock()
         cm.__enter__.return_value = resp
         return cm
@@ -275,13 +275,15 @@ def test_call_llm_stage_enforces_root_keep_alive():
     with patch("scripts.saturday_autonomous_optimizer.wait_for_gpu_free"), \
          patch("scripts.saturday_autonomous_optimizer.evict_model_from_gpu"), \
          patch("urllib.request.urlopen", side_effect=mock_urlopen):
-        res = call_llm_stage("codestral:22b", "sys", "user")
+        res = call_llm_stage("bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M", "sys", "user")
         assert res == {}
         assert len(captured_body) == 1
         body = captured_body[0]
-        # Crucial: keep_alive must be at root level, not inside options
-        assert body.get("keep_alive") == "0s"
-        assert "keep_alive" not in body.get("options", {})
+        assert body.get("model") == "bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M"
+        assert body.get("messages") == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "user"},
+        ]
 
 
 def test_schema_enums_include_all_tunable_params():

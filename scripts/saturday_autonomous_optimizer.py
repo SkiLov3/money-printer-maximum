@@ -67,9 +67,9 @@ CONTINUOUS_DATA = {
 }
 
 DEFAULT_MODELS = {
-    "diagnose": "qwen3.5:122b",
-    "redteam": "llama3.3:70b",
-    "certify": "codestral:22b",
+    "diagnose": "ggml-org/Qwen3.8-Flash-Next-GGUF:IQ4_NL",
+    "redteam": "bartowski/Llama-3.3-70B-Instruct-GGUF:Q4_K_M",
+    "certify": "bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M",
 }
 
 # Real parameters each strategy reads via params.get(...). Candidates outside this map are rejected.
@@ -120,10 +120,10 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
     },
 }
 
-_ollama_raw = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
-_ollama_base = _ollama_raw if _ollama_raw.startswith("http") else f"http://{_ollama_raw}"
-OLLAMA_URL = f"{_ollama_base}/api/chat"
-OLLAMA_VERSION_URL = f"{_ollama_base}/api/version"
+_llama_raw = os.environ.get("LLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST", "127.0.0.1:9931")
+_llama_base = _llama_raw if _llama_raw.startswith("http") else f"http://{_llama_raw}"
+LLAMA_CHAT_URL = f"{_llama_base}/v1/chat/completions"
+LLAMA_HEALTH_URL = f"{_llama_base}/health"
 
 SCHEMA_HYPOTHESIS = {
     "type": "object",
@@ -287,7 +287,7 @@ def is_market_closed() -> bool:
 
 def ping_ollama() -> bool:
     try:
-        req = urllib.request.Request(OLLAMA_VERSION_URL, headers={"User-Agent": "SaturdayOptimizer"})
+        req = urllib.request.Request(LLAMA_HEALTH_URL, headers={"User-Agent": "SaturdayOptimizer"})
         with urllib.request.urlopen(req, timeout=3) as resp:
             return resp.status == 200
     except Exception:
@@ -295,35 +295,39 @@ def ping_ollama() -> bool:
 
 
 def wait_for_gpu_free(timeout_s: int = 45) -> bool:
-    """Polls Ollama /api/ps to confirm GPU memory is cleared before loading the next model."""
+    """Polls llama.cpp /models to confirm no model is currently loaded before loading the next."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         try:
-            req = urllib.request.Request(f"{_ollama_base}/api/ps")
+            req = urllib.request.Request(f"{_llama_base}/models")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.load(resp)
-                if not data.get("models"):
-                    time.sleep(3)  # Apple Silicon unified memory compaction buffer
+                loaded = [
+                    m for m in data.get("data", [])
+                    if isinstance(m.get("status"), dict) and m["status"].get("value") == "loaded"
+                ]
+                if not loaded:
+                    time.sleep(2)  # Apple Silicon unified memory compaction buffer
                     return True
         except Exception as e:
-            logger.debug(f"Ollama poll error: {e}")
+            logger.debug(f"llama.cpp poll error: {e}")
         time.sleep(2)
     logger.warning("GPU eviction confirmation timed out; proceeding.")
     return True
 
 
 def evict_model_from_gpu(model_name: str) -> None:
-    """Explicitly signals Ollama to evict model from Metal GPU memory."""
+    """Explicitly signals llama.cpp router to unload model from Metal GPU memory."""
     try:
         req = urllib.request.Request(
-            f"{_ollama_base}/api/generate",
-            data=json.dumps({"model": model_name, "keep_alive": 0}).encode("utf-8"),
+            f"{_llama_base}/models/unload",
+            data=json.dumps({"model": model_name}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=5):
             pass
     except Exception as e:
-        logger.debug(f"Ollama eviction error: {e}")
+        logger.debug(f"llama.cpp eviction error: {e}")
 
 
 def call_llm_stage(
@@ -333,28 +337,27 @@ def call_llm_stage(
     schema: dict[str, Any] | None = None,
     timeout: int = 300,
 ) -> dict[str, Any] | None:
-    """Invokes a local Ollama model sequentially, enforcing immediate memory eviction."""
+    """Invokes a local llama.cpp model sequentially, enforcing immediate memory eviction."""
     wait_for_gpu_free()
 
     body: dict[str, Any] = {
         "model": model_name,
         "stream": False,
-        "keep_alive": "0s",  # Instruct Ollama to unload immediately upon reply
-        "options": {
-            "num_ctx": 8192,
-            "temperature": 0.15,
-        },
+        "temperature": 0.15,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
     if schema:
-        body["format"] = schema
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": schema},
+        }
 
     try:
         req = urllib.request.Request(
-            OLLAMA_URL,
+            LLAMA_CHAT_URL,
             json.dumps(body).encode("utf-8"),
             {"Content-Type": "application/json"},
         )
@@ -362,7 +365,8 @@ def call_llm_stage(
         t0 = time.time()
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
-            content = data.get("message", {}).get("content", "")
+            choices = data.get("choices", [])
+            content = choices[0].get("message", {}).get("content", "") if choices else ""
             logger.info(f"Model '{model_name}' responded in {time.time()-t0:.1f}s")
             if "```json" in content:
                 content = content.split("```json", 1)[1].split("```", 1)[0].strip()

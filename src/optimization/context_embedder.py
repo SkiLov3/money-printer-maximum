@@ -88,23 +88,25 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def embed_text(
     text: str | list[str],
-    model: str = "nomic-embed-text",
+    model: str = "nomic-ai/nomic-embed-text-v1.5-GGUF:F16",
     host: str | None = None,
     timeout: int = 30,
 ) -> list[float] | list[list[float]]:
-    """Generate high-dimensional vector embeddings via Ollama (default: nomic-embed-text).
+    """Generate high-dimensional vector embeddings via llama.cpp (default: nomic-embed-text-v1.5).
 
     Args:
         text: A single string or a list of strings to embed.
-        model: Embedding model name in Ollama (defaults to 'nomic-embed-text', 768-d).
-        host: Ollama host URL (defaults to OLLAMA_HOST or 'http://127.0.0.1:11434').
+        model: Embedding model name in llama.cpp (defaults to 'nomic-ai/nomic-embed-text-v1.5-GGUF:F16', 768-d).
+        host: llama.cpp router URL (defaults to LLAMA_BASE_URL, OLLAMA_HOST, or 'http://127.0.0.1:9931').
         timeout: Request timeout in seconds.
 
     Returns:
         A 768-d float vector if input is a single string, or a list of vectors if input is a list.
     """
-    ollama_host = host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-    parsed_url = urllib.parse.urlparse(ollama_host)
+    llama_host = host or os.environ.get("LLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:9931")
+    if not llama_host.startswith(("http://", "https://")):
+        llama_host = f"http://{llama_host}"
+    parsed_url = urllib.parse.urlparse(llama_host)
     if parsed_url.scheme not in ("http", "https"):
         raise ValueError(f"Disallowed URL scheme: {parsed_url.scheme}")
 
@@ -118,8 +120,8 @@ def embed_text(
     data = json.dumps(payload).encode("utf-8")
 
     hostname = parsed_url.hostname or "127.0.0.1"
-    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 11434)
-    path = (parsed_url.path.rstrip("/") + "/api/embed") if parsed_url.path else "/api/embed"
+    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 9931)
+    path = (parsed_url.path.rstrip("/") + "/v1/embeddings") if parsed_url.path else "/v1/embeddings"
 
     try:
         connection_cls = http.client.HTTPSConnection if parsed_url.scheme == "https" else http.client.HTTPConnection
@@ -127,15 +129,17 @@ def embed_text(
         conn.request("POST", path, body=data, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         if resp.status != 200:
-            logger.warning(f"Ollama returned HTTP {resp.status} for {path}")
+            logger.warning(f"llama.cpp returned HTTP {resp.status} for {path}")
             conn.close()
             return [] if is_single else []
         result = json.loads(resp.read().decode("utf-8"))
         conn.close()
-        embeddings = result.get("embeddings", [])
+        embeddings = [item.get("embedding", []) for item in result.get("data", [])]
+        if not embeddings and "embeddings" in result:
+            embeddings = result.get("embeddings", [])
         if is_single:
             return embeddings[0] if embeddings else []
         return embeddings
     except Exception as e:
-        logger.warning(f"Failed to generate text embedding via Ollama at {ollama_host}: {e}")
+        logger.warning(f"Failed to generate text embedding via llama.cpp at {llama_host}: {e}")
         return [] if is_single else []
