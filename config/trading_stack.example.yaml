@@ -230,6 +230,7 @@ symbol_brackets:
 routing:
   enabled: true
   risk_per_trade_pct: 0.18    # Equity % risked per trade - set your own
+  max_single_trade_risk_pct: 0.25  # Fraction of max_daily_loss allowed per trade (e.g. 0.25-0.35)
   daily_profit_target: 1500
   daily_loss_halt: 350
   max_consecutive_losses: 2

@@ -285,15 +285,19 @@ class RiskAgent:
                         f"mult={vol_multiplier:.3f}, risk_budget scaled from ${base_risk_budget:.2f} to ${risk_budget:.2f}"
                     )
 
-            # Protective Cap: A single trade should never risk more than 25% of the daily loss limit
-            unscaled_capped_budget = base_risk_budget
+            # Protective Cap: A single trade should never risk more than the configured fraction of the daily loss limit
             if self.max_daily_loss > 0:
-                max_single_trade_risk = float(self.max_daily_loss) * 0.25
-                unscaled_capped_budget = min(unscaled_capped_budget, max_single_trade_risk)
+                raw_cap_pct = self.routing_config.get("max_single_trade_risk_pct", 0.25)
+                try:
+                    cap_pct = float(raw_cap_pct)
+                except (TypeError, ValueError):
+                    cap_pct = 0.25
+                cap_pct = max(0.05, min(1.0, cap_pct))
+                max_single_trade_risk = float(self.max_daily_loss) * cap_pct
                 if risk_budget > max_single_trade_risk:
                     self.logger.info(
                         f"Capping single-trade risk budget from ${risk_budget:.2f} to ${max_single_trade_risk:.2f} "
-                        f"(25% of daily loss limit ${float(self.max_daily_loss):.2f})"
+                        f"({cap_pct * 100:.0f}% of daily loss limit ${float(self.max_daily_loss):.2f})"
                     )
                     risk_budget = max_single_trade_risk
 

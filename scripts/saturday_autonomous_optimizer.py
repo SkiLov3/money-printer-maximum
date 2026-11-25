@@ -1419,6 +1419,11 @@ def _run_optimizer_locked(
 
 
 if __name__ == "__main__":
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        logger.debug("python-dotenv not installed; skipping .env load in optimizer.")
     parser = argparse.ArgumentParser(description="Saturday Autonomous Multi-LLM Optimizer")
     parser.add_argument("--dry-run", action="store_true", help="Report only; do not stage config changes")
     parser.add_argument("--force-offline", action="store_true", help="Bypass market hours check for testing")

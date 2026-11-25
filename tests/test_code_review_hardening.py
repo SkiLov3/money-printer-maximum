@@ -593,6 +593,28 @@ def test_risk_agent_atr_scaled_sl_avoids_double_penalty():
     assert qty_with_flag > qty_no_flag
 
 
+def test_risk_agent_configurable_single_trade_risk_cap():
+    """max_single_trade_risk_pct raises the per-trade dollar cap (e.g., 35% of $350 = $122.50),
+
+    allowing 80-tick MES stops ($100) to take 1 contract instead of rejecting with qty=0.
+    """
+    risk_agent = RiskAgent(account_id="ACC-12345")
+    risk_agent.symbol_brackets = {
+        "MES": {"min_atr": 1.0, "max_atr": 20.0, "tick_size": 0.25, "tick_value": 1.25}
+    }
+    risk_agent.current_balance = Decimal("50900.0")
+    risk_agent.unrealized_pnl = Decimal("0.0")
+    risk_agent.max_daily_loss = Decimal("350.0")
+
+    # Default 25% cap ($87.50) blocks an 80-tick MES stop ($100)
+    risk_agent.routing_config = {"risk_per_trade_pct": 0.25}
+    assert risk_agent.calculate_instrument_quantity("MESZ6", sl_ticks=80) == 0
+
+    # 35% cap ($122.50) allows 1 MES contract on an 80-tick stop
+    risk_agent.routing_config = {"risk_per_trade_pct": 0.25, "max_single_trade_risk_pct": 0.35}
+    assert risk_agent.calculate_instrument_quantity("MESZ6", sl_ticks=80) == 1
+
+
 def test_float_tick_rounding_precision_trade_router_and_execution_agent():
     """(70.30 - 70.10) / 0.01 in floating point produces 19.99999999999993.
 
