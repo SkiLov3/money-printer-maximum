@@ -181,12 +181,12 @@ def test_backtester_session_reset_and_consecutive_loss_halts():
 
     bars = pd.DataFrame(
         [
-            # Bar 0 (Session 1): open 100, drops to 90 -> SL hit (-10 ticks)
-            {"timestamp": "2026-04-01T15:00:00Z", "open": 100.0, "high": 100.0, "low": 90.0, "close": 90.0, "volume": 10},
-            # Bar 1 (Session 1): open 90, drops to 80 -> SL hit (-10 ticks). Consecutive losses = 2 -> Halted!
-            {"timestamp": "2026-04-01T15:01:00Z", "open": 90.0, "high": 90.0, "low": 80.0, "close": 80.0, "volume": 10},
+            # Bar 0 (Session 1): open 100, drops 2.5 pts (-10 ticks) -> SL hit
+            {"timestamp": "2026-04-01T15:00:00Z", "open": 100.0, "high": 100.0, "low": 97.5, "close": 97.5, "volume": 10},
+            # Bar 1 (Session 1): open 97.5, drops 2.5 pts (-10 ticks) -> SL hit. Consecutive losses = 2 -> Halted!
+            {"timestamp": "2026-04-01T15:01:00Z", "open": 97.5, "high": 97.5, "low": 95.0, "close": 95.0, "volume": 10},
             # Bar 2 (Session 1): signal rejected due to consecutive loss halt!
-            {"timestamp": "2026-04-01T15:02:00Z", "open": 80.0, "high": 85.0, "low": 80.0, "close": 85.0, "volume": 10},
+            {"timestamp": "2026-04-01T15:02:00Z", "open": 95.0, "high": 96.0, "low": 95.0, "close": 96.0, "volume": 10},
             # Bar 3: Maintenance / roll boundary: 2026-04-01 22:00 UTC = 18:00 ET. New Globex session begins!
             {"timestamp": "2026-04-01T22:00:00Z", "open": 85.0, "high": 85.0, "low": 85.0, "close": 85.0, "volume": 10},
             # Bar 4 (Session 2): New session allows trade!

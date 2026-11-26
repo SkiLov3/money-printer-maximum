@@ -93,6 +93,27 @@ class RiskAgent:
         self.symbol_halts = set()     # set of halted symbols for current session
         self.max_consecutive_losses = int(self.routing_config.get("max_consecutive_losses", 2))
 
+    def _effective_daily_loss_limit(self) -> Decimal:
+        """Returns the effective daily loss limit considering max_daily_loss and daily_loss_halt."""
+        limits = []
+        if self.max_daily_loss is not None:
+            try:
+                val = Decimal(str(self.max_daily_loss))
+                if val > 0:
+                    limits.append(val)
+            except Exception as e:
+                self.logger.debug(f"Invalid max_daily_loss: {e}")
+        if self.daily_loss_halt is not None:
+            try:
+                val = Decimal(str(self.daily_loss_halt))
+                if val > 0:
+                    limits.append(val)
+            except Exception as e:
+                self.logger.debug(f"Invalid daily_loss_halt: {e}")
+        if limits:
+            return min(limits)
+        return Decimal("0")
+
     def _extract_base(self, symbol: str) -> str:
         import re
 
@@ -286,18 +307,19 @@ class RiskAgent:
                     )
 
             # Protective Cap: A single trade should never risk more than the configured fraction of the daily loss limit
-            if self.max_daily_loss > 0:
+            effective_dll = self._effective_daily_loss_limit()
+            if effective_dll > 0:
                 raw_cap_pct = self.routing_config.get("max_single_trade_risk_pct", 0.25)
                 try:
                     cap_pct = float(raw_cap_pct)
                 except (TypeError, ValueError):
                     cap_pct = 0.25
                 cap_pct = max(0.05, min(1.0, cap_pct))
-                max_single_trade_risk = float(self.max_daily_loss) * cap_pct
+                max_single_trade_risk = float(effective_dll) * cap_pct
                 if risk_budget > max_single_trade_risk:
                     self.logger.info(
                         f"Capping single-trade risk budget from ${risk_budget:.2f} to ${max_single_trade_risk:.2f} "
-                        f"({cap_pct * 100:.0f}% of daily loss limit ${float(self.max_daily_loss):.2f})"
+                        f"({cap_pct * 100:.0f}% of daily loss limit ${float(effective_dll):.2f})"
                     )
                     risk_budget = max_single_trade_risk
 
@@ -335,8 +357,8 @@ class RiskAgent:
                     requested_qty = max(1, int(float(requested_qty) * 0.5))
 
             # 2. DEFENSE: If we are down significantly, reduce to slow the bleed.
-            max_dll_dec = Decimal(str(self.max_daily_loss))
-            if self.current_daily_pnl < -(max_dll_dec * Decimal("0.5")):
+            effective_dll = self._effective_daily_loss_limit()
+            if effective_dll > 0 and self.current_daily_pnl < -(effective_dll * Decimal("0.5")):
                 self.logger.info("Daily loss safeguard. Reducing size to minimum.")
                 requested_qty = 1
 

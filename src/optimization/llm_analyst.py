@@ -54,7 +54,7 @@ class LLMAnalyst:
         provider = str(self.config.get("provider", "claude")).strip().lower()
         runners = [
             ("claude", self.config.get("claude", ["claude", "-p"])),
-            ("codex", self.config.get("codex", ["codex", "exec", "--full-auto"])),
+            ("codex", self.config.get("codex", ["codex", "exec", "--sandbox", "read-only"])),
             ("gemini", self.config.get("gemini", ["gemini", "-p"])),
         ]
         if provider:

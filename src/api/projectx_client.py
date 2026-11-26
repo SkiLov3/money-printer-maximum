@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import time
 
 import requests
@@ -145,6 +146,10 @@ class ProjectXClient:
         self._reconnect_lock = threading.Lock()
         self._symbol_cache_lock = threading.RLock()
         self._last_reconnect_attempt = 0.0
+
+    @staticmethod
+    def _redact_token(value) -> str:
+        return re.sub(r"(access_token=)[^&\s'\"\]\)]+", r"\1<REDACTED>", str(value))
 
     @staticmethod
     def _build_refreshed_ws_url(base_url: str, access_token: str, existing_url: str | None) -> str:
@@ -784,7 +789,7 @@ class ProjectXClient:
             self._on_reconnect_ext = on_reconnect
         try:
             # TopstepX requires the token explicitly in the WSS query string
-            ws_url = f"{self.hub_url}?access_token={self.access_token}"
+            ws_url = self._build_refreshed_ws_url(str(self.hub_url), str(self.access_token), None)
             self.connection = HubConnectionBuilder()\
                 .with_url(ws_url, {
                     "access_token_factory": self._token_factory,
@@ -801,7 +806,7 @@ class ProjectXClient:
             self.connection.on_reconnect(self.on_reconnect)
             self.connection.on_close(self.on_close)
             def _on_market_error(error):
-                self.logger.error(f"SignalR Error: {error}")
+                self.logger.error(f"SignalR Error: {self._redact_token(error)}")
                 if "401" in str(error) or "Unauthorized" in str(error):
                     self.logger.warning("SignalR 401 detected in error handler, triggering token refresh")
                     self.is_connected = False
@@ -1075,7 +1080,7 @@ class ProjectXClient:
         if on_user_event is not None:
             self._on_user_event = on_user_event
         try:
-            ws_url = f"{self.user_hub_url}?access_token={self.access_token}"
+            ws_url = self._build_refreshed_ws_url(str(self.user_hub_url), str(self.access_token), None)
             self.user_connection = HubConnectionBuilder()\
                 .with_url(ws_url, {"access_token_factory": self._token_factory})\
                 .with_automatic_reconnect({
@@ -1090,7 +1095,7 @@ class ProjectXClient:
             self.user_connection.on_close(self._on_user_hub_close)
             self.user_connection.on_reconnect(self._on_user_hub_reconnect)
             def _on_user_error(error):
-                self.logger.error(f"User-hub SignalR Error: {error}")
+                self.logger.error(f"User-hub SignalR Error: {self._redact_token(error)}")
                 if "401" in str(error) or "Unauthorized" in str(error):
                     self.logger.warning("User-hub 401 detected in error handler, triggering token refresh")
                     self.user_is_connected = False

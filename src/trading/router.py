@@ -65,6 +65,9 @@ class TradeRouter:
             meta_fn = getattr(getattr(self.execution_agent, "client", None), "get_contract_meta", None)
             c_meta = meta_fn(trade_intent["symbol"]) if callable(meta_fn) else None
             tick_sz = float(c_meta.get("tickSize") or 0.0) if isinstance(c_meta, dict) else 0.0
+            if tick_sz <= 0.0 and hasattr(self.risk_agent, "get_tick_size"):
+                tick_sz = float(self.risk_agent.get_tick_size(trade_intent["symbol"]) or 0.0)
+
             if tick_sz > 0:
                 try:
                     ep = float(trade_intent.get("entry_price") or route_context["current_price"])

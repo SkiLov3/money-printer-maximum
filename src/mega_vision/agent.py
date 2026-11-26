@@ -58,7 +58,7 @@ class MegaVisionConfig:
             max_retries_per_decision=int(data.get("max_retries_per_decision", 2)),
             fallback_on_timeout_seconds=int(data.get("fallback_on_timeout_seconds", 30)),
             claude_command=list(data.get("claude", {}).get("command", ["claude", "-p"])),
-            codex_command=list(data.get("codex", {}).get("command", ["codex", "exec", "--full-auto"])),
+            codex_command=list(data.get("codex", {}).get("command", ["codex", "exec", "--sandbox", "read-only"])),
             gemini_command=list(data.get("gemini", {}).get("command", ["gemini", "-p"])),
         )
 
@@ -100,7 +100,7 @@ class MegaStrategyAgent:
                 system_prompt=self._load_system_prompt(),
                 model=model,
                 max_turns=4,
-                permission_mode="bypassPermissions",
+                allowed_tools=[],
             )
             chunks: list[str] = []
             async for message in query(prompt=prompt, options=options):
@@ -116,7 +116,7 @@ class MegaStrategyAgent:
         return self._spawn_subprocess(self.config.claude_command or ["claude", "-p"], prompt)
 
     def _spawn_codex(self, prompt: str) -> str:
-        command = list(self.config.codex_command or ["codex", "exec", "--full-auto"])
+        command = list(self.config.codex_command or ["codex", "exec", "--sandbox", "read-only"])
         binary_name = Path(command[0]).stem.lower() if command else ""
         if binary_name == "codex" and len(command) >= 2 and command[1] == "exec":
             command.append(prompt[:8000])

@@ -150,7 +150,9 @@ class MTFTrendScalperStrategy(BaseStrategy):
                 dt_et = None
 
         # 1. RTH Time Filter
-        if self.allowed_entry_hours_et and dt_et is not None:
+        if self.allowed_entry_hours_et:
+            if dt_et is None:
+                return None
             if dt_et.hour not in self.allowed_entry_hours_et:
                 return None
             # Skip first N mins of market open (09:30 - 09:35 ET) and last M mins (15:45 - 16:00 ET)
@@ -254,7 +256,7 @@ class MTFTrendScalperStrategy(BaseStrategy):
                     self._last_evaluated_ltf_ts = ltf_bar_ts
                     return None
             except Exception:
-                pass
+                return None
 
             if self._last_signal_index == ltf_bar_ts:
                 return None

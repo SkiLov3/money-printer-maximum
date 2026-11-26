@@ -263,18 +263,14 @@ def test_call_llm_stage_enforces_openai_chat_format():
     """Verifies that call_llm_stage posts OpenAI-compatible messages to llama.cpp router."""
     captured_body = []
 
-    def mock_urlopen(req, timeout=300):
-        data = json.loads(req.data.decode("utf-8"))
-        captured_body.append(data)
-        resp = MagicMock()
-        resp.read.return_value = json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode("utf-8")
-        cm = MagicMock()
-        cm.__enter__.return_value = resp
-        return cm
+    def mock_llama_request(method, endpoint, payload=None, timeout=300, headers=None):
+        if payload:
+            captured_body.append(payload)
+        return 200, json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode("utf-8")
 
     with patch("scripts.saturday_autonomous_optimizer.wait_for_gpu_free"), \
          patch("scripts.saturday_autonomous_optimizer.evict_model_from_gpu"), \
-         patch("urllib.request.urlopen", side_effect=mock_urlopen):
+         patch("scripts.saturday_autonomous_optimizer._llama_http_request", side_effect=mock_llama_request):
         res = call_llm_stage("bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M", "sys", "user")
         assert res == {}
         assert len(captured_body) == 1

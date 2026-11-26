@@ -1,7 +1,9 @@
 # type: ignore
 import asyncio
 import io
+import json
 import math
+import os
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,7 +12,10 @@ import pandas as pd
 import pytest
 
 from dashboard import Handler
-from scripts.saturday_autonomous_optimizer import is_valid_param_value
+from scripts.saturday_autonomous_optimizer import (
+    _get_llama_base_url,
+    is_valid_param_value,
+)
 from src.agents.news_agent import NewsAgent
 from src.agents.risk_agent import RiskAgent
 from src.agents.supervisor_agent import SupervisorAgent
@@ -18,6 +23,7 @@ from src.api.projectx_client import ProjectXClient
 from src.strategies.engine import StrategyEngine
 from src.strategies.mtf_trend_scalper import MTFTrendScalperStrategy
 from src.strategies.orb_vwap import ORBVWAPStrategy
+from src.trading.router import TradeRouter
 from src.utils.backtester import Backtester
 
 
@@ -670,3 +676,254 @@ def test_saturday_optimizer_bounds():
     """scripts.saturday_autonomous_optimizer.is_valid_param_value bounds check."""
     assert is_valid_param_value("orb_vwap", "min_volume_ratio", 1.2) is True
     assert is_valid_param_value("orb_vwap", "min_volume_ratio", 5.0) is False
+
+
+# ---------------------------------------------------------------------------
+# 9. Batch 4: Regression Tests for Batches 1–3
+# ---------------------------------------------------------------------------
+
+def test_risk_agent_effective_daily_loss_limit_cap():
+    """Verify RiskAgent per-trade dollar cap uses daily_loss_halt if lower than max_daily_loss."""
+    risk_agent = RiskAgent(account_id="ACC-12345")
+    risk_agent.symbol_brackets = {
+        "MES": {"min_atr": 1.0, "max_atr": 20.0, "tick_size": 0.25, "tick_value": 1.25}
+    }
+    risk_agent.current_balance = Decimal("50000.0")
+    risk_agent.unrealized_pnl = Decimal("0.0")
+
+    # max_daily_loss = 1000, daily_loss_halt = 350
+    # max_single_trade_risk_pct = 0.35
+    # Per-trade cap: 0.35 * 350 = 122.50 (NOT 0.35 * 1000 = 350)
+    risk_agent.max_daily_loss = Decimal("1000")
+    risk_agent.daily_loss_halt = Decimal("350")
+    risk_agent.routing_config = {
+        "risk_per_trade_pct": 0.35,  # 0.35% of 50k = $175 budget
+        "max_single_trade_risk_pct": 0.35  # Caps budget at 35% of 350 = $122.50
+    }
+
+    # 100 ticks MES = $125. 125 > 122.50 -> qty should be 0.
+    assert risk_agent.calculate_instrument_quantity("MESZ6", sl_ticks=100) == 0
+    # 90 ticks MES = $112.50. 112.50 < 122.50 -> qty should be 1.
+    assert risk_agent.calculate_instrument_quantity("MESZ6", sl_ticks=90) == 1
+
+
+def test_risk_agent_dynamic_quantity_halt_threshold():
+    """get_dynamic_quantity drops to 1 if realized pnl < -50% of daily_loss_halt."""
+    risk_agent = RiskAgent(account_id="ACC-12345")
+    risk_agent.max_daily_loss = Decimal("1000")
+    risk_agent.daily_loss_halt = Decimal("350")
+    # -200 is < -50% of 350 (-175), even though it is > -50% of 1000 (-500)
+    risk_agent.current_daily_pnl = Decimal("-200")
+
+    # Mock weighted total to allow new trades
+    risk_agent._weighted_open_total = MagicMock(return_value=Decimal("0"))
+    risk_agent.max_total_contracts = Decimal("10")
+    risk_agent._full_equiv_weight = MagicMock(return_value=Decimal("1"))
+
+    assert risk_agent.get_dynamic_quantity("MESZ6", requested_qty=5) == 1
+
+
+def test_trade_router_get_tick_size_fallback():
+    """TradeRouter falls back to risk_agent.get_tick_size when client meta is missing."""
+    risk_agent = MagicMock()
+    risk_agent.get_tick_size.return_value = 0.25
+    risk_agent.get_entry_quantity.return_value = 1
+    risk_agent.validate_trade.return_value = True
+
+    execution_agent = MagicMock()
+    # client.get_contract_meta returns None
+    execution_agent.client.get_contract_meta.return_value = None
+    execution_agent.execute_trade.return_value = {"status": "ok"}
+
+    router = TradeRouter(risk_agent, execution_agent)
+
+    trade_intent = {
+        "symbol": "MESZ6",
+        "quantity": 1,
+        "side": "Buy",
+        "metadata": {"stop_price": 4990.0}
+    }
+    route_context = {"current_price": 5000.0}
+
+    # Should call risk_agent.get_tick_size("MESZ6")
+    router.route_trade(trade_intent, route_context)
+    risk_agent.get_tick_size.assert_called_with("MESZ6")
+
+
+def test_mtf_trend_scalper_fail_closed_on_bad_timestamp():
+    """MTFTrendScalperStrategy on_bar returns None on unparseable timestamp when hour filter active."""
+    strat = MTFTrendScalperStrategy("MESZ6", {"allowed_entry_hours_et": [9, 10]})
+    strat.warmup_bars = 0
+
+    df_bars = pd.DataFrame([{"timestamp": "not-a-timestamp", "close": 5000.0}])
+    df_indicators = df_bars.copy()
+
+    sig = strat.on_bar(0, df_bars, df_indicators)
+    assert sig is None
+
+    # Test with None
+    df_bars_none = pd.DataFrame([{"timestamp": None, "close": 5000.0}])
+    sig_none = strat.on_bar(0, df_bars_none, df_bars_none)
+    assert sig_none is None
+
+
+def test_projectx_client_redact_token():
+    """ProjectXClient._redact_token replaces JWT while preserving other params."""
+    url = "wss://rtc.topstepx.com/hubs/market?access_token=eyJhbGciOi.secret.sig&foo=1"
+    redacted = ProjectXClient._redact_token(url)
+    assert "access_token=<REDACTED>" in redacted
+    assert "&foo=1" in redacted
+    assert "eyJhbGciOi" not in redacted
+
+
+def test_dashboard_healthz_public():
+    """GET /healthz is accessible without auth."""
+    handler = Handler.__new__(Handler)
+    handler.path = "/healthz"
+    handler.headers = {}
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    handler.wfile = MagicMock()
+
+    handler.do_GET()
+    handler.send_response.assert_called_once_with(200)
+
+
+def test_dashboard_host_header_validation():
+    """Dashboard rejects invalid Host headers with 403."""
+    handler = Handler.__new__(Handler)
+    handler.headers = {"Host": "rebind.evil.com:8765"}
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    handler.wfile = MagicMock()
+
+    # Should return False and send 403
+    assert handler._check_host_header() is False
+    handler.send_response.assert_called_once_with(403)
+
+    # Valid hosts
+    for h in ["localhost:8765", "127.0.0.1:8765"]:
+        handler.headers = {"Host": h}
+        handler.send_response.reset_mock()
+        assert handler._check_host_header() is True
+        handler.send_response.assert_not_called()
+
+
+def test_dashboard_security_headers_and_integrity():
+    """Verify CSP does not have unsafe-eval/jsdelivr and script has integrity."""
+    from dashboard import HTML
+    assert 'integrity="sha384-' in HTML
+    assert 'crossorigin="anonymous"' in HTML
+
+    handler = Handler.__new__(Handler)
+    handler.request_version = "HTTP/1.1"
+    handler.connection = MagicMock()
+    handler._headers_buffer = []
+    handler.wfile = io.BytesIO()
+    handler.send_header = MagicMock()
+    handler.end_headers()
+
+    # Find CSP header
+    csp = next(call.args[1] for call in handler.send_header.call_args_list if call.args[0] == "Content-Security-Policy")
+    assert "'unsafe-eval'" not in csp
+    assert "cdn.jsdelivr.net" not in csp
+
+
+def test_dashboard_env_edit_anchoring(tmp_path, monkeypatch):
+    """Verify .env edit only replaces line-anchored MAX_DAILY_LOSS."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("# MAX_DAILY_LOSS=999\nOTHER_MAX_DAILY_LOSS=999\nMAX_DAILY_LOSS=1000\n", encoding="utf-8")
+
+    handler = Handler.__new__(Handler)
+    handler.supervisor = MagicMock()
+    handler.supervisor.risk_agent = MagicMock()
+    handler.headers = {"Content-Length": "25", "Host": "localhost"}
+    handler.rfile = io.BytesIO(json.dumps({"max_daily_loss": 500}).encode())
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    handler.wfile = io.BytesIO()
+    handler.path = "/api/risk-config"
+
+    # Mock PASSWORD check to pass
+    import dashboard
+    with patch("dashboard.PASSWORD", ""), \
+         patch("dashboard.os.path.exists", return_value=True), \
+         patch("dashboard._is_allowed_host", return_value=True), \
+         patch("dashboard.Handler._check_same_origin", return_value=True):
+
+        # We need to more carefully mock the file operations in do_POST
+        monkeypatch.setattr(dashboard, "os", MagicMock(wraps=os))
+        dashboard.os.path.exists.return_value = True
+
+        # Mock open for reading .env and for NamedTemporaryFile
+        mock_read_f = io.StringIO("# MAX_DAILY_LOSS=999\nOTHER_MAX_DAILY_LOSS=999\nMAX_DAILY_LOSS=1000\n")
+        mock_write_f = io.StringIO()
+        mock_write_f.name = str(tmp_path / "temp_env")
+
+        def side_effect_open(path, *args, **kwargs):
+            if path == ".env":
+                m = MagicMock()
+                m.__enter__.return_value = mock_read_f
+                return m
+            return MagicMock()
+
+        monkeypatch.setitem(dashboard.__dict__, "open", side_effect_open)
+
+        # Mock tempfile.NamedTemporaryFile to return our mock_write_f
+        mock_ntf = MagicMock()
+        mock_ntf.__enter__.return_value = mock_write_f
+        monkeypatch.setattr("dashboard.tempfile.NamedTemporaryFile", MagicMock(return_value=mock_ntf))
+
+        handler.do_POST()
+
+        # Check what was written to temp file
+        written_content = mock_write_f.getvalue()
+        assert "MAX_DAILY_LOSS=500" in written_content
+        assert "# MAX_DAILY_LOSS=999" in written_content
+        assert "OTHER_MAX_DAILY_LOSS=999" in written_content
+        # Verify it didn't corrupt the other lines
+        assert written_content == "# MAX_DAILY_LOSS=999\nOTHER_MAX_DAILY_LOSS=999\nMAX_DAILY_LOSS=500\n"
+
+        # Verify chmod 0o600
+        dashboard.os.chmod.assert_called_once_with(mock_write_f.name, 0o600)
+
+
+def test_dashboard_optimizer_concurrency_conflict():
+    """Verify /api/saturday-optimizer/run returns 409 if already running."""
+    handler = Handler.__new__(Handler)
+    handler.path = "/api/saturday-optimizer/run"
+    handler.headers = {}
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+    handler.wfile = MagicMock()
+
+    with patch("dashboard.PASSWORD", ""), \
+         patch("dashboard._OPTIMIZER_PROC") as mock_proc:
+        mock_proc.poll.return_value = None  # Still running
+        handler.do_POST()
+        handler.send_response.assert_called_once_with(409)
+
+
+def test_saturday_optimizer_ssrf_protection(monkeypatch):
+    """Verify LLAMA_BASE_URL validation rejects remote/file URLs."""
+    monkeypatch.setenv("LLAMA_BASE_URL", "file:///etc/passwd")
+    with pytest.raises(ValueError, match="Invalid LLAMA_BASE_URL scheme"):
+        _get_llama_base_url()
+
+    monkeypatch.setenv("LLAMA_BASE_URL", "http://169.254.169.254")
+    with pytest.raises(ValueError, match="Remote LLAMA_BASE_URL hostname"):
+        _get_llama_base_url()
+
+    # Allowed even if remote if flag set
+    monkeypatch.setenv("LLAMA_ALLOW_REMOTE", "1")
+    assert _get_llama_base_url() == "http://169.254.169.254"
+
+    # Always allow local/docker
+    monkeypatch.delenv("LLAMA_ALLOW_REMOTE", raising=False)
+    for host in ["127.0.0.1", "localhost", "host.docker.internal"]:
+        monkeypatch.setenv("LLAMA_BASE_URL", f"http://{host}:9931")
+        assert _get_llama_base_url() == f"http://{host}:9931"

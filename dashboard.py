@@ -6,7 +6,7 @@ Then open: http://localhost:8765  (or http://<droplet-ip>:8765 remotely)
 
 ENV VARS:
   DASHBOARD_PORT      Port to bind (default: 8765)
-  DASHBOARD_HOST      Host to bind (default: 0.0.0.0 — accessible remotely)
+  DASHBOARD_HOST      Host to bind (default: 127.0.0.1 — use DASHBOARD_ALLOWED_HOSTS if exposing via reverse proxy)
   DASHBOARD_PASSWORD  Set this on a public droplet! Browser will prompt for password.
 """
 import base64
@@ -27,6 +27,46 @@ load_dotenv()
 
 logger = logging.getLogger("dashboard")
 _ENV_WRITE_LOCK = threading.Lock()
+_OPTIMIZER_PROC_LOCK = threading.Lock()
+_OPTIMIZER_PROC = None
+
+
+def _is_allowed_host(host_header: str) -> bool:
+    """DNS Rebinding Protection: Verify Host header against allowed list."""
+    if not host_header:
+        return True  # Allow HTTP/1.0 or test stubs; _check_same_origin handles CSRF.
+
+    try:
+        # urlparse requires a scheme to parse netloc correctly
+        hostname = urlparse(f"http://{host_header.strip()}").hostname
+    except Exception:
+        return False
+
+    if not hostname:
+        return False
+
+    hostname = hostname.lower()
+    allowed = {"127.0.0.1", "localhost", "::1"}
+
+    # Add HOST if it is a specific loopback or local address
+    host_lower = (HOST or "").lower()
+    try:
+        import ipaddress
+        if not ipaddress.ip_address(host_lower).is_unspecified:
+            allowed.add(host_lower)
+    except ValueError:
+        if host_lower:
+            allowed.add(host_lower)
+
+    # Add from environment
+    extra = os.getenv("DASHBOARD_ALLOWED_HOSTS", "")
+    if extra:
+        for h in extra.split(","):
+            h = h.strip().lower()
+            if h:
+                allowed.add(h)
+
+    return hostname in allowed
 
 STATUS_FILE = Path("logs/bot_status.json")
 try:
@@ -48,7 +88,7 @@ HTML = """<!DOCTYPE html>
 <title>TopstepX Swarm — Live Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
-<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js" integrity="sha384-stKllnUqA9AD0gsKCuUtf5XlqAW7PwIgDagoNsTWkjkBmJ/GZ/uHTgEBxdLV2VSK" crossorigin="anonymous"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -470,7 +510,7 @@ const chartOverlayRefreshMs = 10000;
 
 function setBadge(id, cls, dotCls, text) {
   const el = $(id); el.className = 'badge ' + cls;
-  el.innerHTML = `<div class="dot ${dotCls}"></div>${text}`;
+  el.innerHTML = `<div class="dot ${esc(dotCls)}"></div>${esc(text)}`;
 }
 
 function showTab(name) {
@@ -505,7 +545,7 @@ function updateChartSymbols(symbols) {
   const select = $('chart-symbol');
   if (!Array.isArray(symbols) || symbols.length === 0) return;
   const current = select.value || activeChartSymbol || symbols[0];
-  const nextHtml = symbols.map(sym => `<option value="${sym}">${sym}</option>`).join('');
+  const nextHtml = symbols.map(sym => `<option value="${esc(sym)}">${esc(sym)}</option>`).join('');
   if (select.innerHTML !== nextHtml) select.innerHTML = nextHtml;
   activeChartSymbol = symbols.includes(current) ? current : symbols[0];
   select.value = activeChartSymbol;
@@ -1199,7 +1239,7 @@ function renderSaturdayOptimizer(sat) {
     <div style="background: var(--surface2); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
       <div style="font-size: 10px; color: var(--muted); text-transform: uppercase;">Active Phase</div>
       <div style="font-size: 14px; font-weight: 700; color: var(--text); margin-top: 4px;">${esc(phase)}</div>
-      <div style="font-size: 11px; color: var(--muted);">${sat.extracted_trades_count ?? 0} trades audited</div>
+      <div style="font-size: 11px; color: var(--muted);">${Number(sat.extracted_trades_count ?? 0)} trades audited</div>
     </div>
     <div style="background: var(--surface2); padding: 12px; border-radius: 8px; border: 1px solid var(--border);">
       <div style="font-size: 10px; color: var(--muted); text-transform: uppercase;">Decision / Outcome</div>
@@ -1268,7 +1308,7 @@ function renderSaturdayOptimizer(sat) {
       <td style="color:${base.total_pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${fmt$(base.total_pnl)}</td>
       <td style="color:${base.holdout_pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${fmt$(base.holdout_pnl)}</td>
       <td>${fmtB(base.max_drawdown ?? 0)}</td>
-      <td>${base.total_trades}</td>
+      <td>${Number(base.total_trades ?? 0)}</td>
       <td>${basePill}</td>
     </tr>`;
   }
@@ -1293,7 +1333,7 @@ function renderSaturdayOptimizer(sat) {
         <td style="color:${r.total_pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${fmt$(r.total_pnl)}</td>
         <td style="color:${r.holdout_pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${fmt$(r.holdout_pnl)}</td>
         <td>${fmtB(r.max_drawdown ?? 0)}</td>
-        <td>${r.total_trades}</td>
+        <td>${Number(r.total_trades ?? 0)}</td>
         <td>${candPill}</td>
       </tr>`;
     }
@@ -1345,17 +1385,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com; "
+            "script-src 'self' 'unsafe-inline' https://unpkg.com; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
             "img-src 'self' data:; "
-            "connect-src 'self' https://cdn.jsdelivr.net https://unpkg.com;"
+            "connect-src 'self' https://unpkg.com;"
         )
         super().end_headers()
+
+    def _check_host_header(self) -> bool:
+        if not _is_allowed_host(self.headers.get("Host", "")):
+            logger.warning("Dashboard: Invalid Host header from %s", getattr(self, "client_address", None))
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Invalid Host header"}).encode("utf-8"))
+            return False
+        return True
 
     def _require_auth(self) -> bool:
         if _check_auth(self):
             return True
+        logger.warning("Dashboard: unauthorized request to %s from %s", self.path, getattr(self, "client_address", None))
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="TopstepX Dashboard"')
         self.send_header("Content-Type", "text/plain")
@@ -1384,6 +1435,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self):
+        if not self._check_host_header():
+            return
         if not self._require_auth():
             return
         if not self._check_same_origin():
@@ -1392,7 +1445,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/flatten":
             import asyncio
             if hasattr(self, 'supervisor') and self.supervisor and self.supervisor.loop:
-                self.log_message("Dashboard: Triggering EMERGENCY FLATTEN via API")
+                logger.warning("Dashboard: Triggering EMERGENCY FLATTEN via API")
                 # Thread-safe async call
                 asyncio.run_coroutine_threadsafe(
                     self.supervisor._flatten_all_emergency(),
@@ -1410,43 +1463,51 @@ class Handler(BaseHTTPRequestHandler):
             import subprocess
             import sys
             try:
-                if hasattr(self, 'supervisor') and self.supervisor:
-                    active_pos = getattr(self.supervisor, 'active_positions', None) or {}
-                    has_positions = any(active_pos.values()) if isinstance(active_pos, dict) else bool(active_pos)
-                    if has_positions:
-                        self.send_response(400)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "Optimizer cannot run while positions are open."}).encode("utf-8"))
-                        return
-                    opt_task = getattr(self.supervisor, '_optimizer_task', None)
-                    if opt_task and hasattr(opt_task, 'done') and not opt_task.done():
+                with _OPTIMIZER_PROC_LOCK:
+                    global _OPTIMIZER_PROC
+                    if _OPTIMIZER_PROC is not None and _OPTIMIZER_PROC.poll() is None:
                         self.send_response(409)
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(json.dumps({"error": "Optimizer is already running."}).encode("utf-8"))
                         return
-                    from datetime import datetime, timezone
-                    news_agent = getattr(self.supervisor, 'news_agent', None)
-                    is_open = bool(news_agent and hasattr(news_agent, 'is_market_hours') and news_agent.is_market_hours(datetime.now(timezone.utc)))
-                    if (is_open or getattr(self.supervisor, 'market_open', False)) and hasattr(self.supervisor, 'logger'):
-                        self.supervisor.logger.warning("Manual optimizer dry-run triggered via dashboard during market hours.")
-                cmd = [sys.executable, "scripts/saturday_autonomous_optimizer.py", "--dry-run", "--force-offline"]
-                subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+
+                    if hasattr(self, 'supervisor') and self.supervisor:
+                        active_pos = getattr(self.supervisor, 'active_positions', None) or {}
+                        has_positions = any(active_pos.values()) if isinstance(active_pos, dict) else bool(active_pos)
+                        if has_positions:
+                            self.send_response(400)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "Optimizer cannot run while positions are open."}).encode("utf-8"))
+                            return
+                        from datetime import datetime, timezone
+                        news_agent = getattr(self.supervisor, 'news_agent', None)
+                        is_open = bool(news_agent and hasattr(news_agent, 'is_market_hours') and news_agent.is_market_hours(datetime.now(timezone.utc)))
+                        if (is_open or getattr(self.supervisor, 'market_open', False)) and hasattr(self.supervisor, 'logger'):
+                            self.supervisor.logger.warning("Manual optimizer dry-run triggered via dashboard during market hours.")
+
+                    cmd = [sys.executable, "scripts/saturday_autonomous_optimizer.py", "--dry-run", "--force-offline"]
+                    _OPTIMIZER_PROC = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    logger.info("Dashboard: Spawned Saturday Optimizer dry-run (PID %s)", _OPTIMIZER_PROC.pid)
+
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "started", "mode": "dry-run"}).encode("utf-8"))
             except Exception as exc:
-                self.send_response(500)
+                logger.warning("Dashboard: Optimizer run failed: %s", exc)
+                status_code = 400 if isinstance(exc, ValueError) else 500
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                msg = str(exc) if isinstance(exc, ValueError) else "Internal server error"
+                self.wfile.write(json.dumps({"error": msg}).encode("utf-8"))
         elif self.path == "/api/risk-config":
             if not hasattr(self, 'supervisor') or not self.supervisor:
                 self.send_response(500)
@@ -1495,8 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
                             with open(env_path, encoding="utf-8") as f:
                                 content = f.read()
 
-                            if "MAX_DAILY_LOSS" in content:
-                                content = re.sub(r"MAX_DAILY_LOSS=.*", f"MAX_DAILY_LOSS={val_str}", content)
+                            if re.search(r"(?m)^MAX_DAILY_LOSS=", content):
+                                content = re.sub(r"(?m)^MAX_DAILY_LOSS=.*$", f"MAX_DAILY_LOSS={val_str}", content)
                             else:
                                 content = content.rstrip() + f"\nMAX_DAILY_LOSS={val_str}\n"
 
@@ -1506,8 +1567,9 @@ class Handler(BaseHTTPRequestHandler):
                                 with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dir_name, delete=False) as tf:
                                     tf.write(content)
                                     temp_name = tf.name
-                                os.chmod(temp_name, os.stat(env_path).st_mode)
+                                os.chmod(temp_name, 0o600)
                                 os.replace(temp_name, env_path)
+                                logger.warning("Dashboard: updated max_daily_loss to %s", val_str)
                             except Exception:
                                 if temp_name and os.path.exists(temp_name):
                                     with contextlib.suppress(OSError):
@@ -1519,19 +1581,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "success", "max_daily_loss": new_dll}).encode("utf-8"))
             except Exception as exc:
-                self.send_response(400)
+                logger.warning("Dashboard: risk-config update failed: %s", exc)
+                status_code = 400 if isinstance(exc, ValueError) else 500
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                msg = str(exc) if isinstance(exc, ValueError) else "Request failed"
+                self.wfile.write(json.dumps({"error": msg}).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
-        if not self._require_auth():
+        if not self._check_host_header():
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/healthz":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode())
+            return
+        if not self._require_auth():
+            return
         if path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1562,10 +1635,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(payload).encode("utf-8"))
             except Exception as exc:
-                self.send_response(400)
+                logger.warning("Dashboard: chart data failed: %s", exc)
+                status_code = 400 if isinstance(exc, ValueError) else 500
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                msg = str(exc) if isinstance(exc, ValueError) else "Internal server error"
+                self.wfile.write(json.dumps({"error": msg}).encode("utf-8"))
         elif path == "/api/chart/live":
             if not hasattr(self, 'supervisor') or not self.supervisor:
                 self.send_response(503)
@@ -1587,10 +1663,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(payload).encode("utf-8"))
             except Exception as exc:
-                self.send_response(400)
+                logger.warning("Dashboard: live chart data failed: %s", exc)
+                status_code = 400 if isinstance(exc, ValueError) else 500
+                self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(exc)}).encode("utf-8"))
+                msg = str(exc) if isinstance(exc, ValueError) else "Internal server error"
+                self.wfile.write(json.dumps({"error": msg}).encode("utf-8"))
         elif path == "/api/status":
             if STATUS_FILE.exists():
                 try:
@@ -1624,6 +1703,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if HOST not in ("127.0.0.1", "localhost", "::1") and not PASSWORD:
+        if not Path("/.dockerenv").exists() and os.getenv("DASHBOARD_ALLOW_INSECURE_BIND") != "1":
+            raise SystemExit("Refusing to bind non-loopback DASHBOARD_HOST without DASHBOARD_PASSWORD. Set DASHBOARD_PASSWORD or DASHBOARD_ALLOW_INSECURE_BIND=1.")
+        else:
+            logger.warning("DASHBOARD: Binding to non-loopback interface WITHOUT a password. Ensure this port is protected by a firewall or reverse proxy.")
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"\n  ⚡ TopstepX Dashboard  →  http://localhost:{PORT}")
     if HOST not in ("127.0.0.1", "localhost"):

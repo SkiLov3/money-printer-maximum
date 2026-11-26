@@ -123,6 +123,7 @@ def embed_text(
     port = parsed_url.port or (443 if parsed_url.scheme == "https" else 9931)
     path = (parsed_url.path.rstrip("/") + "/v1/embeddings") if parsed_url.path else "/v1/embeddings"
 
+    conn = None
     try:
         connection_cls = http.client.HTTPSConnection if parsed_url.scheme == "https" else http.client.HTTPConnection
         conn = connection_cls(hostname, port, timeout=timeout)
@@ -130,10 +131,8 @@ def embed_text(
         resp = conn.getresponse()
         if resp.status != 200:
             logger.warning(f"llama.cpp returned HTTP {resp.status} for {path}")
-            conn.close()
             return [] if is_single else []
         result = json.loads(resp.read().decode("utf-8"))
-        conn.close()
         embeddings = [item.get("embedding", []) for item in result.get("data", [])]
         if not embeddings and "embeddings" in result:
             embeddings = result.get("embeddings", [])
@@ -143,3 +142,6 @@ def embed_text(
     except Exception as e:
         logger.warning(f"Failed to generate text embedding via llama.cpp at {llama_host}: {e}")
         return [] if is_single else []
+    finally:
+        if conn is not None:
+            conn.close()
