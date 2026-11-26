@@ -26,8 +26,8 @@ class _BacktestExecutionAgent:
 class Backtester:
     SIGNAL_COOLDOWN_SECONDS = 300
     WIN_COOLDOWN_SECONDS = 120
-    LOSS_COOLDOWN_SECONDS = 600
-    STREAK_COOLDOWN_SECONDS = 1800
+    LOSS_COOLDOWN_SECONDS = 1800
+    STREAK_COOLDOWN_SECONDS = 3600
 
     def __init__(
         self,
@@ -79,7 +79,9 @@ class Backtester:
             "YM": 5.0,
             "MYM": 0.5,
             "NKD": 25.0,
-            "MNK": 0.5,
+            "MNK": 2.5,
+            "6E": 6.25,
+            "M6E": 0.625,
         }
         self.tick_value = tick_values.get(self.base_symbol, 5.0)
         self.max_positions = 2 if self.strategy.is_micro else 1
@@ -201,7 +203,7 @@ class Backtester:
         self._reset_state()
         frame = self._normalize_dataframe(df)
         indicators = prepared_indicators.copy() if prepared_indicators is not None else self.strategy._calculate_indicators(frame)
-        bars = indicators[["timestamp", "open", "high", "low", "close", "volume", "price"]].copy()
+        bars = pd.DataFrame(indicators[["timestamp", "open", "high", "low", "close", "volume", "price"]].copy())
 
         self.equity_history = [self.balance]
         self.equity_curve = []
@@ -252,8 +254,8 @@ class Backtester:
             self.equity_curve.append({"timestamp": current_time_str, "equity": equity_value})
             self.screenshot_capture.on_bar_end()
             if self.routing_mode == "optimizer_fast" and not self.active_trades and pending_signal is None:
-                risk_hit, _ = self.risk_agent.is_risk_limit_hit()
-                if risk_hit:
+                risk_hit, risk_reason = self.risk_agent.is_risk_limit_hit()
+                if risk_hit and "Maximum Loss Limit" in str(risk_reason):
                     break
 
         results = self._get_results()
@@ -308,13 +310,20 @@ class Backtester:
         }
         routed = self._route_signal(signal, route_context)
         if isinstance(routed, RouterRejection):
+            eng = getattr(getattr(self, "strategy", None), "engine", None)
+            for strat in (getattr(eng, "strategies", None) or []):
+                if getattr(strat, "name", None) == signal.get("strategy_name"):
+                    hook = getattr(strat, "on_signal_rejected", None)
+                    if callable(hook):
+                        hook(signal)
+
             self.telemetry.record_signal(
                 self.symbol,
                 signal["strategy_name"],
                 f"blocked_{routed.stage}",
                 signal["side"],
                 current_time,
-                float(row.get("close", row.get("price", 0))),
+                float(row.get("close", row.get("price", 0)) or 0.0),
                 routed.reason,
                 signal.get("metadata", {}),
             )
@@ -355,8 +364,9 @@ class Backtester:
         if self.routing_mode != "optimizer_fast":
             return self.trade_router.route_trade(signal, route_context)
 
+        allow_flips = bool((self.routing_config.get("entry_filters", {}) or {}).get("allow_flips", False))
         is_flip = any(existing["side"] != signal["side"] for existing in self.active_trades)
-        if not is_flip and int(route_context.get("active_count", 0)) >= int(route_context.get("max_positions", 1)):
+        if (not is_flip or not allow_flips) and int(route_context.get("active_count", 0)) >= int(route_context.get("max_positions", 1)):
             return RouterRejection("already at max positions", "filter", "max_positions")
         risk_hit, risk_reason = self.risk_agent.is_risk_limit_hit()
         if risk_hit:
@@ -369,6 +379,7 @@ class Backtester:
             sl_ticks=signal.get("sl_ticks"),
             current_price=route_context.get("current_price"),
             current_atr=metadata.get("atr"),
+            atr_scaled_sl=bool(metadata.get("atr_scaled_sl", False)),
         )
         if quantity <= 0:
             return RouterRejection("quantity sizing returned 0", "size")
@@ -391,15 +402,18 @@ class Backtester:
         for existing in list(self.active_trades):
             if existing["side"] != signal["side"]:
                 self.active_trades.remove(existing)
-                exit_price = (
-                    entry_price - (self.slippage_ticks * self.tick_size)
-                    if existing["side"] == "Buy"
-                    else entry_price + (self.slippage_ticks * self.tick_size)
-                )
+                exit_price = float(entry_price)
+                if existing["side"] == "Buy":
+                    existing["mfe_price"] = max(float(existing.get("mfe_price", existing["entry"])), exit_price)
+                    existing["mae_price"] = min(float(existing.get("mae_price", existing["entry"])), exit_price)
+                else:
+                    existing["mfe_price"] = min(float(existing.get("mfe_price", existing["entry"])), exit_price)
+                    existing["mae_price"] = max(float(existing.get("mae_price", existing["entry"])), exit_price)
                 pnl = self._calculate_final_pnl(existing, exit_price)
                 timestamp_str = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
                 self._record_trade(existing, exit_price, pnl, "REVERSAL", timestamp_str)
                 self.risk_agent.record_position_close(self.symbol)
+                self.risk_agent.set_pending(self.symbol, False)
                 self.risk_agent.record_trade_result(pnl, symbol=self.symbol)
                 self._last_trade_won = pnl > 0
                 return
@@ -411,19 +425,19 @@ class Backtester:
         if stop_price is not None and not pd.isna(stop_price):
             stop_price = float(stop_price)
             if signal["side"] == "Buy" and stop_price < entry_price:
-                sl_ticks = max(1, int(np.ceil((entry_price - stop_price) / self.tick_size)))
+                sl_ticks = max(1, int(np.ceil(round((entry_price - stop_price) / self.tick_size, 6))))
             elif signal["side"] == "Sell" and stop_price > entry_price:
-                sl_ticks = max(1, int(np.ceil((stop_price - entry_price) / self.tick_size)))
+                sl_ticks = max(1, int(np.ceil(round((stop_price - entry_price) / self.tick_size, 6))))
         target_price = metadata.get("target_price")
         target_r_multiple = metadata.get("target_r_multiple")
         if target_price is not None and not pd.isna(target_price):
             target_price = float(target_price)
             if signal["side"] == "Buy" and target_price > entry_price:
-                tp_ticks = max(1, int(np.floor((target_price - entry_price) / self.tick_size)))
+                tp_ticks = max(1, int(np.floor(round((target_price - entry_price) / self.tick_size, 6))))
             elif signal["side"] == "Sell" and target_price < entry_price:
-                tp_ticks = max(1, int(np.floor((entry_price - target_price) / self.tick_size)))
+                tp_ticks = max(1, int(np.floor(round((entry_price - target_price) / self.tick_size, 6))))
         elif target_r_multiple is not None and not pd.isna(target_r_multiple):
-            tp_ticks = max(1, int(round(sl_ticks * float(target_r_multiple))))
+            tp_ticks = max(1, round(sl_ticks * float(target_r_multiple)))
 
         trade = {
             "side": signal["side"],
@@ -472,7 +486,7 @@ class Backtester:
         to_remove = []
         operational_filters_enabled = self.routing_mode not in ("optimizer_search", "optimizer_fast")
         news_event = operational_filters_enabled and self.news_agent.is_news_approaching(timestamp, lead_minutes=2)
-        eod_flatten = operational_filters_enabled and self.news_agent.is_near_close(timestamp, lead_minutes=0)
+        eod_flatten = operational_filters_enabled and self.news_agent.is_near_close(timestamp, lead_minutes=15)
 
         for trade in self.active_trades:
             if trade.pop("pending_daily_profit_lock_exit", False):
@@ -509,17 +523,24 @@ class Backtester:
             is_tp_hit = (trade["side"] == "Buy" and high >= trade["tp_price"]) or (trade["side"] == "Sell" and low <= trade["tp_price"])
 
             if is_sl_hit:
-                exit_price = (
-                    trade["sl_price"] - (self.slippage_ticks * self.tick_size)
-                    if trade["side"] == "Buy"
-                    else trade["sl_price"] + (self.slippage_ticks * self.tick_size)
-                )
+                if trade["side"] == "Buy":
+                    fill_base = min(open_p, trade["sl_price"])
+                    exit_price = fill_base - (self.slippage_ticks * self.tick_size)
+                else:
+                    fill_base = max(open_p, trade["sl_price"])
+                    exit_price = fill_base + (self.slippage_ticks * self.tick_size)
                 pnl = self._calculate_final_pnl(trade, exit_price)
                 result = "BE" if trade["be_triggered"] else "SL"
                 is_profitable_trail = (trade["side"] == "Buy" and exit_price > trade["entry"]) or (trade["side"] == "Sell" and exit_price < trade["entry"])
                 if trade["be_triggered"] and trade["trail_mult"] > 0 and is_profitable_trail:
                     result = "TRAIL"
                 self._record_trade(trade, exit_price, pnl, result, timestamp_str)
+                if result == "SL":
+                    eng = getattr(getattr(self, "strategy", None), "engine", None)
+                    for strat in getattr(eng, "strategies", None) or []:
+                        hook = getattr(strat, "notify_stop_exit", None)
+                        if callable(hook):
+                            hook(timestamp)
                 self.risk_agent.record_trade_result(pnl, symbol=self.symbol)
                 self._last_trade_won = pnl > 0
                 to_remove.append(trade)
@@ -559,7 +580,11 @@ class Backtester:
                         trade["be_triggered"] = True
                         trade["sl_price"] = trade["entry"]
                 else:
-                    exit_price = open_p
+                    exit_price = (
+                        close - (self.slippage_ticks * self.tick_size)
+                        if trade["side"] == "Buy"
+                        else close + (self.slippage_ticks * self.tick_size)
+                    )
                     pnl = self._calculate_final_pnl(trade, exit_price)
                     self._record_trade(trade, exit_price, pnl, "PRO-EXIT", timestamp_str)
                     self.risk_agent.record_trade_result(pnl, symbol=self.symbol)
@@ -597,7 +622,7 @@ class Backtester:
             return False
         column = str(metadata.get("profit_wave_slow_column", "smm_ema21"))
         wave = row.get(column)
-        close = float(row.get("close", row.get("price", 0.0)))
+        close = float(row.get("close", row.get("price", 0.0)) or 0.0)
         if metadata.get("smm_exit_on_dashboard_reversal"):
             trend_switch = int(row.get("smm_trend_switch", 0) or 0)
             mfi = float(row.get("smm_mfi", 50.0) or 50.0)
@@ -622,6 +647,16 @@ class Backtester:
         return gross_pnl - round_trip_commission
 
     def _record_trade(self, trade, exit_price, pnl, result, timestamp):
+        entry_price = float(trade["entry"])
+        mfe_price = float(trade.get("mfe_price", entry_price))
+        mae_price = float(trade.get("mae_price", entry_price))
+        if trade["side"] == "Buy":
+            mfe_ticks = max(0.0, (mfe_price - entry_price) / self.tick_size) if self.tick_size > 0 else 0.0
+            mae_ticks = max(0.0, (entry_price - mae_price) / self.tick_size) if self.tick_size > 0 else 0.0
+        else:
+            mfe_ticks = max(0.0, (entry_price - mfe_price) / self.tick_size) if self.tick_size > 0 else 0.0
+            mae_ticks = max(0.0, (mae_price - entry_price) / self.tick_size) if self.tick_size > 0 else 0.0
+        sl_ticks = max(1, int(trade.get("sl_ticks", 1) or 1))
         record = {
             "side": trade["side"],
             "entry": trade["entry"],
@@ -631,6 +666,13 @@ class Backtester:
             "time_open": trade["time_open"],
             "time_close": timestamp,
             "qty": trade["qty"],
+            "sl_ticks": int(trade.get("sl_ticks", 0) or 0),
+            "tp_ticks": int(trade.get("tp_ticks", 0) or 0),
+            "mfe_ticks": round(mfe_ticks, 2),
+            "mae_ticks": round(mae_ticks, 2),
+            "mae_dollars": round(mae_ticks * float(getattr(self, "tick_value", 0.0) or 0.0) * int(trade.get("qty", 1) or 1), 2),
+            "mfe_r": round(mfe_ticks / sl_ticks, 2),
+            "mae_r": round(mae_ticks / sl_ticks, 2),
             "strategy_name": trade.get("strategy_name", "unknown"),
             "metadata": trade.get("metadata", {}),
             "entry_screenshot": trade.get("entry_screenshot"),
@@ -639,8 +681,8 @@ class Backtester:
         self.balance += pnl
         try:
             self.last_signal_time = pd.to_datetime(timestamp).timestamp()
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            self.last_signal_time = 0.0
         self._sync_risk_state()
         self.telemetry.record_trade_close(
             self.symbol,

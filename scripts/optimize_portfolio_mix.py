@@ -125,7 +125,7 @@ def main() -> int:
     from concurrent.futures import ProcessPoolExecutor
     import os
 
-    num_workers = max(1, os.cpu_count() - 1)
+    num_workers = max(1, (os.cpu_count() or 2) - 1)
     print(f"Running optimization with {num_workers} processes...", flush=True)
 
     worker_args = [(c, data, combine_rules, str(args.routing_mode)) for c in candidates]
@@ -2040,7 +2040,10 @@ def portfolio_metrics(portfolio_result: dict[str, Any], data: dict[str, dict[str
 def daily_pnl(trades: list[dict[str, Any]]) -> dict[Any, float]:
     daily: dict[Any, float] = {}
     for trade in trades:
-        ts = pd.to_datetime(trade.get("time_close") or trade.get("exit_time"), utc=True, errors="coerce")
+        raw_ts = trade.get("time_close") or trade.get("exit_time")
+        if not raw_ts:
+            continue
+        ts = pd.to_datetime(str(raw_ts), utc=True, errors="coerce")
         if pd.isna(ts):
             continue
         day = ts.date()

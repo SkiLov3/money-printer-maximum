@@ -7,9 +7,9 @@ Verifies:
 - Fallback hypotheses when LLM is unavailable
 """
 import json
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -259,29 +259,27 @@ def test_stage_llama_redteam_api_failure_fallback_to_conservative_grid():
         assert "fallback" in audit.get("redteam_summary", "").lower()
 
 
-def test_call_llm_stage_enforces_root_keep_alive():
-    """Verifies that call_llm_stage places keep_alive at top level of request body per Ollama API spec."""
+def test_call_llm_stage_enforces_openai_chat_format():
+    """Verifies that call_llm_stage posts OpenAI-compatible messages to llama.cpp router."""
     captured_body = []
 
-    def mock_urlopen(req, timeout=300):
-        data = json.loads(req.data.decode("utf-8"))
-        captured_body.append(data)
-        resp = MagicMock()
-        resp.read.return_value = json.dumps({"message": {"content": "{}"}}).encode("utf-8")
-        cm = MagicMock()
-        cm.__enter__.return_value = resp
-        return cm
+    def mock_llama_request(method, endpoint, payload=None, timeout=300, headers=None):
+        if payload:
+            captured_body.append(payload)
+        return 200, json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode("utf-8")
 
     with patch("scripts.saturday_autonomous_optimizer.wait_for_gpu_free"), \
          patch("scripts.saturday_autonomous_optimizer.evict_model_from_gpu"), \
-         patch("urllib.request.urlopen", side_effect=mock_urlopen):
-        res = call_llm_stage("codestral:22b", "sys", "user")
+         patch("scripts.saturday_autonomous_optimizer._llama_http_request", side_effect=mock_llama_request):
+        res = call_llm_stage("bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M", "sys", "user")
         assert res == {}
         assert len(captured_body) == 1
         body = captured_body[0]
-        # Crucial: keep_alive must be at root level, not inside options
-        assert body.get("keep_alive") == "0s"
-        assert "keep_alive" not in body.get("options", {})
+        assert body.get("model") == "bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M"
+        assert body.get("messages") == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "user"},
+        ]
 
 
 def test_schema_enums_include_all_tunable_params():
@@ -474,6 +472,87 @@ def test_apply_param_override_mirrors_asian_orb_and_symbol_params():
     mtf_params = cfg["strategies"]["strategies"][1]["params"]
     assert mtf_params["min_adx"] == 30.0
     assert mtf_params["symbol_params"]["MES"]["min_adx"] == 30.0
+
+
+def test_reclaim_ticks_tunable_and_mfe_mae_excursion_telemetry(temp_dir):
+    """Verifies fade_reclaim_ticks/asian_fade_reclaim_ticks whitelist and MFE/MAE telemetry extraction."""
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    from scripts.saturday_autonomous_optimizer import (
+        apply_param_override,
+        extract_recent_trades,
+        is_valid_candidate_param,
+        query_llm_hypotheses,
+    )
+    from src.persistence.database import DatabaseService
+
+    assert is_valid_candidate_param("orb_vwap", "fade_reclaim_ticks") is True
+    assert is_valid_candidate_param("orb_vwap", "asian_fade_reclaim_ticks") is True
+
+    cfg = {
+        "strategies": {
+            "strategies": [
+                {
+                    "name": "orb_vwap",
+                    "enabled": True,
+                    "params": {
+                        "opening_range_enabled": False,
+                        "asian_enabled": True,
+                        "fade_reclaim_ticks": 0,
+                        "asian_fade_reclaim_ticks": 0,
+                    },
+                }
+            ]
+        }
+    }
+    assert apply_param_override(cfg, "orb_vwap", "asian_fade_reclaim_ticks", 2) is True
+    orb_p = cfg["strategies"]["strategies"][0]["params"]
+    assert orb_p["asian_fade_reclaim_ticks"] == 2
+    assert orb_p["fade_reclaim_ticks"] == 2
+
+    db_file = temp_dir / "test_excursions.db"
+    db = DatabaseService({"enabled": True, "backend": "sqlite", "sqlite_path": str(db_file)})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.persist_trade_outcome(
+        trade_key="mfe-mae-1",  # gitleaks:allow
+        symbol="MCLZ6",
+        order_id="1001",
+        account_id="12345678",
+        session="ASIAN",
+        pnl=-50.0,
+        close_type="stop",
+        closed_at=now_iso,
+        outcome={
+            "closed_position": {"strategy_name": "orb_vwap", "side": "Sell", "qty": 1, "entry": 70.00, "sl_ticks": 20},
+            "mfe_ticks": 30.0,
+            "mae_ticks": 20.0,
+            "mfe_r": 1.5,
+            "mae_r": 1.0,
+        },
+    )
+    db.close()
+
+    trades = extract_recent_trades(db_file, days=7)
+    assert len(trades) == 1
+    captured_payload = {}
+
+    def _fake_call(model, sys_p, user_c, schema=None, timeout=180):
+        captured_payload["data"] = json.loads(user_c)
+        return {"analysis_summary": "ok", "identified_flaws": [], "hypotheses": []}
+
+    with (
+        patch("scripts.saturday_autonomous_optimizer.ping_ollama", return_value=True),
+        patch("scripts.saturday_autonomous_optimizer.call_llm_stage", side_effect=_fake_call),
+    ):
+        query_llm_hypotheses(trades)
+
+    loss_item = captured_payload["data"]["sample_losses"][0]
+    assert loss_item["mfe_ticks"] == 30.0
+    assert loss_item["mae_ticks"] == 20.0
+    assert loss_item["mfe_r"] == 1.5
+    assert loss_item["mae_r"] == 1.0
+
 
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -52,13 +53,51 @@ class TradeRouter:
             blocker = decisions[-1]
             return RouterRejection(blocker.reason, "filter", blocker.name, {"decisions": [d.__dict__ for d in decisions]})
 
-        quantity = self.risk_agent.get_entry_quantity(
-            trade_intent["symbol"],
-            int(trade_intent["quantity"]),
-            sl_ticks=trade_intent.get("sl_ticks"),
-            current_price=route_context.get("current_price"),
-            current_atr=trade_intent.get("metadata", {}).get("atr"),
-        )
+        metadata = trade_intent.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        effective_sl_ticks = trade_intent.get("sl_ticks")
+        if (
+            metadata.get("stop_price") is not None
+            and route_context.get("current_price") is not None
+        ):
+            meta_fn = getattr(getattr(self.execution_agent, "client", None), "get_contract_meta", None)
+            c_meta = meta_fn(trade_intent["symbol"]) if callable(meta_fn) else None
+            tick_sz = float(c_meta.get("tickSize") or 0.0) if isinstance(c_meta, dict) else 0.0
+            if tick_sz <= 0.0 and hasattr(self.risk_agent, "get_tick_size"):
+                tick_sz = float(self.risk_agent.get_tick_size(trade_intent["symbol"]) or 0.0)
+
+            if tick_sz > 0:
+                try:
+                    ep = float(trade_intent.get("entry_price") or route_context["current_price"])
+                    sp = float(metadata["stop_price"])
+                    side_norm = str(trade_intent.get("side") or "").strip().lower()
+                    if side_norm in ("buy", "long") and sp < ep:
+                        effective_sl_ticks = max(1, int(math.ceil(round((ep - sp) / tick_sz, 6))))
+                    elif side_norm in ("sell", "short") and sp > ep:
+                        effective_sl_ticks = max(1, int(math.ceil(round((sp - ep) / tick_sz, 6))))
+                except (ValueError, TypeError):
+                    effective_sl_ticks = trade_intent.get("sl_ticks")
+
+        try:
+            quantity = self.risk_agent.get_entry_quantity(
+                trade_intent["symbol"],
+                int(trade_intent["quantity"]),
+                sl_ticks=effective_sl_ticks,
+                current_price=route_context.get("current_price"),
+                current_atr=metadata.get("atr"),
+                atr_scaled_sl=bool(metadata.get("atr_scaled_sl", False)),
+            )
+        except TypeError:
+            # Fallback for mock risk_agent in tests that doesn't accept atr_scaled_sl
+            quantity = self.risk_agent.get_entry_quantity(
+                trade_intent["symbol"],
+                int(trade_intent["quantity"]),
+                sl_ticks=effective_sl_ticks,
+                current_price=route_context.get("current_price"),
+                current_atr=metadata.get("atr"),
+            )
         if quantity <= 0:
             return RouterRejection("quantity sizing returned 0", "size")
 
@@ -67,6 +106,8 @@ class TradeRouter:
 
         routed_intent = dict(trade_intent)
         routed_intent["quantity"] = quantity
+        if routed_intent.get("entry_price") is None and route_context.get("current_price"):
+            routed_intent["entry_price"] = route_context.get("current_price")
         self.risk_agent.set_pending(trade_intent["symbol"], True)
         try:
             result = self.execution_agent.execute_trade(routed_intent)

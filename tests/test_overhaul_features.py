@@ -65,6 +65,7 @@ def test_filter_manager_blocks_news_standdown():
 def test_instrument_quantity_uses_registered_contract():
     from decimal import Decimal
     risk_agent = RiskAgent("TEST")
+    risk_agent.daily_loss_halt = None
     risk_agent.max_daily_loss = Decimal("1000.0")
     risk_agent.register_contract(
         "MNQ",
@@ -78,6 +79,8 @@ def test_instrument_quantity_uses_registered_contract():
 def test_instrument_quantity_caps_at_25_pct_of_daily_loss_limit():
     from decimal import Decimal
     risk_agent = RiskAgent("TEST")
+    risk_agent.daily_loss_halt = None
+    risk_agent.routing_config["max_single_trade_risk_pct"] = 0.25
     risk_agent.max_daily_loss = Decimal("500.0")
     risk_agent.register_contract(
         "MNQ",

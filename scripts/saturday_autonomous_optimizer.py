@@ -18,27 +18,39 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import copy
 import fcntl
+import gc
+import http.client
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import time
-import urllib.request
+import urllib.parse
+import zoneinfo
 from datetime import datetime, timedelta, timezone
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from pathlib import Path
 from typing import Any
-import zoneinfo
+
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.config.settings import load_stack_config, get_strategy_config
+from src.config.settings import get_strategy_config, load_stack_config
 from src.utils.backtester import Backtester
 
 logging.basicConfig(
@@ -62,9 +74,9 @@ CONTINUOUS_DATA = {
 }
 
 DEFAULT_MODELS = {
-    "diagnose": "qwen3.5:122b",
-    "redteam": "llama3.3:70b",
-    "certify": "codestral:22b",
+    "diagnose": "ggml-org/Qwen3.8-Flash-Next-GGUF:IQ4_NL",
+    "redteam": "bartowski/Llama-3.3-70B-Instruct-GGUF:Q4_K_M",
+    "certify": "bartowski/Codestral-22B-v0.1-GGUF:Q4_K_M",
 }
 
 # Real parameters each strategy reads via params.get(...). Candidates outside this map are rejected.
@@ -76,20 +88,105 @@ TUNABLE_PARAMS: dict[str, tuple[str, ...]] = {
         "min_or_ticks",
         "max_or_ticks",
         "breakout_buffer_ticks",
+        "fade_reclaim_ticks",
         "asian_risk_reward",
         "asian_min_or_ticks",
         "asian_max_or_ticks",
         "asian_min_volume_ratio",
         "asian_stop_buffer_ticks",
         "asian_breakout_buffer_ticks",
+        "asian_fade_reclaim_ticks",
     ),
 }
 ALL_TUNABLE_PARAMS: list[str] = [p for params in TUNABLE_PARAMS.values() for p in params]
 
-_ollama_raw = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
-_ollama_base = _ollama_raw if _ollama_raw.startswith("http") else f"http://{_ollama_raw}"
-OLLAMA_URL = f"{_ollama_base}/api/chat"
-OLLAMA_VERSION_URL = f"{_ollama_base}/api/version"
+PARAM_BOUNDS: dict[str, dict[str, tuple[float, float]]] = {
+    "mtf_trend_scalper": {
+        "min_adx": (15.0, 45.0),
+        "sl_atr_mult": (1.0, 3.5),
+        "tp_atr_mult": (1.5, 6.0),
+        "min_stop_ticks": (8.0, 40.0),
+        "max_stop_ticks": (30.0, 120.0),
+        "skip_open_minutes": (0.0, 30.0),
+        "skip_close_minutes": (0.0, 30.0),
+    },
+    "orb_vwap": {
+        "risk_reward": (1.0, 4.0),
+        "min_or_ticks": (5.0, 40.0),
+        "max_or_ticks": (30.0, 200.0),
+        "breakout_buffer_ticks": (0.0, 10.0),
+        "fade_reclaim_ticks": (0.0, 10.0),
+        "asian_risk_reward": (1.0, 4.0),
+        "asian_min_or_ticks": (5.0, 40.0),
+        "asian_max_or_ticks": (30.0, 200.0),
+        "asian_min_volume_ratio": (0.0, 3.0),
+        "asian_stop_buffer_ticks": (0.0, 10.0),
+        "asian_breakout_buffer_ticks": (0.0, 10.0),
+        "asian_fade_reclaim_ticks": (0.0, 10.0),
+        "min_volume_ratio": (0.0, 3.0),
+    },
+}
+
+_ALLOWED_LLAMA_HOSTS = {"127.0.0.1", "localhost", "::1", "host.docker.internal"}
+
+
+def _get_llama_base_url() -> str:
+    raw = os.environ.get("LLAMA_BASE_URL") or os.environ.get("OLLAMA_HOST", "127.0.0.1:9931")
+    url = raw if "://" in raw else f"http://{raw}"
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Invalid LLAMA_BASE_URL scheme: {parsed.scheme}")
+    if not parsed.hostname:
+        raise ValueError("Invalid LLAMA_BASE_URL: missing hostname")
+    if parsed.hostname not in _ALLOWED_LLAMA_HOSTS and os.environ.get("LLAMA_ALLOW_REMOTE") != "1":
+        raise ValueError(f"Remote LLAMA_BASE_URL hostname '{parsed.hostname}' not allowed")
+    return url.rstrip("/")
+
+
+def _llama_http_request(
+    method: str,
+    endpoint: str,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 30,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    base_url = _get_llama_base_url()
+    parsed = urllib.parse.urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"No hostname in base URL: {base_url}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    base_path = parsed.path.rstrip("/")
+
+    conn: http.client.HTTPConnection | http.client.HTTPSConnection
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
+    try:
+        url = f"{base_path}{endpoint}"
+        req_headers = {"User-Agent": "SaturdayOptimizer"}
+        if headers:
+            req_headers.update(headers)
+
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            if "Content-Type" not in req_headers:
+                req_headers["Content-Type"] = "application/json"
+
+        conn.request(method, url, body=body, headers=req_headers)
+        resp = conn.getresponse()
+        # Note: Not following redirects as per security requirements
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+_llama_base = _get_llama_base_url()
+LLAMA_CHAT_URL = f"{_llama_base}/v1/chat/completions"
+LLAMA_HEALTH_URL = f"{_llama_base}/health"
 
 SCHEMA_HYPOTHESIS = {
     "type": "object",
@@ -165,6 +262,21 @@ SCHEMA_CERTIFICATION = {
 }
 
 
+def _sanitize_json_numbers(obj: Any) -> Any:
+    """Replace non-finite floats (inf/-inf/nan) with finite JSON-safe equivalents."""
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return 0.0
+        if math.isinf(obj):
+            return 999.0 if obj > 0 else -999.0
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_numbers(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json_numbers(v) for v in obj]
+    return obj
+
+
 class StateManager:
     """Resumable state machine to survive machine reboots, sleep, or interruptions."""
 
@@ -181,7 +293,7 @@ class StateManager:
                 logger.warning(f"Could not recover tmp state file: {e}")
         if self.path.exists():
             try:
-                with open(self.path, "r", encoding="utf-8") as f:
+                with open(self.path, encoding="utf-8") as f:
                     loaded = json.load(f)
                 today_et = datetime.now(zoneinfo.ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
                 if loaded.get("phase") == "COMPLETED" and loaded.get("run_id") != today_et:
@@ -209,8 +321,9 @@ class StateManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         try:
+            sanitized = _sanitize_json_numbers(self.state)
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
+                json.dump(sanitized, f, indent=2, allow_nan=False)
             os.replace(tmp, self.path)
         except Exception as e:
             logger.error(f"Failed to persist state file {self.path}: {e}")
@@ -237,43 +350,49 @@ def is_market_closed() -> bool:
 
 def ping_ollama() -> bool:
     try:
-        req = urllib.request.Request(OLLAMA_VERSION_URL, headers={"User-Agent": "SaturdayOptimizer"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return resp.status == 200
+        status, _ = _llama_http_request("GET", "/health", timeout=3)
+        return status == 200
     except Exception:
         return False
 
 
+ping_llama_router = ping_ollama
+
+
 def wait_for_gpu_free(timeout_s: int = 45) -> bool:
-    """Polls Ollama /api/ps to confirm GPU memory is cleared before loading the next model."""
+    """Polls llama.cpp /models to confirm no model is currently loaded before loading the next."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         try:
-            req = urllib.request.Request(f"{_ollama_base}/api/ps")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.load(resp)
-                if not data.get("models"):
-                    time.sleep(3)  # Apple Silicon unified memory compaction buffer
+            status, body = _llama_http_request("GET", "/models", timeout=3)
+            if status == 200:
+                data = json.loads(body)
+                loaded = [
+                    m
+                    for m in data.get("data", [])
+                    if isinstance(m.get("status"), dict) and m["status"].get("value") == "loaded"
+                ]
+                if not loaded:
+                    time.sleep(2)  # Apple Silicon unified memory compaction buffer
                     return True
         except Exception as e:
-            logger.debug(f"Ollama poll error: {e}")
+            logger.debug(f"llama.cpp poll error: {e}")
         time.sleep(2)
     logger.warning("GPU eviction confirmation timed out; proceeding.")
     return True
 
 
 def evict_model_from_gpu(model_name: str) -> None:
-    """Explicitly signals Ollama to evict model from Metal GPU memory."""
+    """Explicitly signals llama.cpp router to unload model from Metal GPU memory."""
     try:
-        req = urllib.request.Request(
-            f"{_ollama_base}/api/generate",
-            data=json.dumps({"model": model_name, "keep_alive": 0}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+        _llama_http_request(
+            "POST",
+            "/models/unload",
+            payload={"model": model_name},
+            timeout=5,
         )
-        with urllib.request.urlopen(req, timeout=5):
-            pass
     except Exception as e:
-        logger.debug(f"Ollama eviction error: {e}")
+        logger.debug(f"llama.cpp eviction error: {e}")
 
 
 def call_llm_stage(
@@ -283,42 +402,46 @@ def call_llm_stage(
     schema: dict[str, Any] | None = None,
     timeout: int = 300,
 ) -> dict[str, Any] | None:
-    """Invokes a local Ollama model sequentially, enforcing immediate memory eviction."""
+    """Invokes a local llama.cpp model sequentially, enforcing immediate memory eviction."""
     wait_for_gpu_free()
 
     body: dict[str, Any] = {
         "model": model_name,
         "stream": False,
-        "keep_alive": "0s",  # Instruct Ollama to unload immediately upon reply
-        "options": {
-            "num_ctx": 8192,
-            "temperature": 0.15,
-        },
+        "temperature": 0.15,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
     if schema:
-        body["format"] = schema
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": schema},
+        }
 
     try:
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            json.dumps(body).encode("utf-8"),
-            {"Content-Type": "application/json"},
-        )
         logger.info(f"Querying model '{model_name}' on local GPU...")
         t0 = time.time()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.load(resp)
-            content = data.get("message", {}).get("content", "")
-            logger.info(f"Model '{model_name}' responded in {time.time()-t0:.1f}s")
-            if "```json" in content:
-                content = content.split("```json", 1)[1].split("```", 1)[0].strip()
-            elif "```" in content:
-                content = content.split("```", 1)[1].split("```", 1)[0].strip()
-            return json.loads(content)
+        status, body_bytes = _llama_http_request(
+            "POST",
+            "/v1/chat/completions",
+            payload=body,
+            timeout=timeout,
+        )
+        if status != 200:
+            logger.error(f"LLM stage failed with status {status}: {body_bytes.decode('utf-8', 'ignore')}")
+            return None
+
+        data = json.loads(body_bytes)
+        choices = data.get("choices", [])
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        logger.info(f"Model '{model_name}' responded in {time.time()-t0:.1f}s")
+        if "```json" in content:
+            content = content.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in content:
+            content = content.split("```", 1)[1].split("```", 1)[0].strip()
+        return json.loads(content)
     except Exception as e:
         logger.error(f"Error calling model '{model_name}': {e}")
         return None
@@ -327,15 +450,20 @@ def call_llm_stage(
 
 
 def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
-    """Extracts recent trades from swarm.db in read-only mode."""
+    """Extracts recent trades from swarm.db via an atomic snapshot backup."""
     if not db_path.exists():
         logger.error(f"Database not found: {db_path}")
         return []
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
+    src_con: sqlite3.Connection | None = None
+    con: sqlite3.Connection | None = None
     try:
+        src_con = sqlite3.connect(str(db_path), timeout=10.0)
+        src_con.execute("PRAGMA busy_timeout=10000")
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        src_con.backup(con)
         rows = con.execute(
             """
             SELECT o.id,
@@ -350,6 +478,7 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
                    COALESCE(c.selected_signal_json, '{}') AS selected_signal_json,
                    COALESCE(c.account_snapshot_json, '{}') AS account_snapshot_json,
                    COALESCE(c.route_context_json, '{}') AS route_context_json,
+                   COALESCE(o.outcome_json, '{}') AS outcome_json,
                    o.pnl,
                    o.close_type
             FROM trade_outcomes o
@@ -360,43 +489,69 @@ def extract_recent_trades(db_path: Path, days: int = 7) -> list[dict[str, Any]]:
             (cutoff,),
         ).fetchall()
         return [dict(r) for r in rows]
+    except sqlite3.Error as exc:
+        logger.warning(f"Failed to extract recent trades from {db_path}: {exc}")
+        return []
     finally:
-        con.close()
+        if con is not None:
+            con.close()
+        if src_con is not None:
+            src_con.close()
+
+
+def _format_trade_sample(t: dict[str, Any]) -> dict[str, Any]:
+    sig_meta = {}
+    raw_sig = t.get("selected_signal_json")
+    if raw_sig:
+        try:
+            sig_meta = json.loads(raw_sig).get("metadata", {})
+        except (ValueError, TypeError, AttributeError):
+            sig_meta = {}
+    outcome_meta = {}
+    raw_out = t.get("outcome_json")
+    if raw_out:
+        try:
+            parsed_out = json.loads(raw_out)
+            if isinstance(parsed_out, dict):
+                outcome_meta = parsed_out
+        except (ValueError, TypeError):
+            outcome_meta = {}
+    entry = {
+        "symbol": t.get("symbol"),
+        "strategy": t.get("strategy_name"),
+        "side": t.get("side"),
+        "pnl": t.get("pnl"),
+        "close_type": t.get("close_type"),
+        "session": t.get("session"),
+        "signal_details": sig_meta,
+    }
+    for exc_key in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r"):
+        val = outcome_meta.get(exc_key)
+        if val is None and isinstance(outcome_meta.get("closed_position"), dict):
+            val = outcome_meta["closed_position"].get(exc_key)
+        if val is not None:
+            entry[exc_key] = val
+    return entry
 
 
 def query_llm_hypotheses(trades: list[dict[str, Any]], model: str = DEFAULT_MODELS["diagnose"]) -> dict[str, Any]:
     """Stage 1: Asks local Qwen 3.5 (122B) to diagnose losing trades and propose parameter sweep hypotheses."""
     if not ping_ollama():
-        logger.warning("Ollama is not running. Using deterministic fallback parameter grid.")
+        logger.warning("Llama router is not running. Using deterministic fallback parameter grid.")
         return get_fallback_hypotheses()
 
     losses = [t for t in trades if t.get("pnl", 0) <= 0]
     wins = [t for t in trades if t.get("pnl", 0) > 0]
 
-    sample_losses = []
-    for t in losses[:15]:
-        sig_meta = {}
-        raw_sig = t.get("selected_signal_json")
-        if raw_sig:
-            try:
-                sig_meta = json.loads(raw_sig).get("metadata", {})
-            except Exception:
-                sig_meta = {}
-        sample_losses.append({
-            "symbol": t.get("symbol"),
-            "strategy": t.get("strategy_name"),
-            "side": t.get("side"),
-            "pnl": t.get("pnl"),
-            "close_type": t.get("close_type"),
-            "session": t.get("session"),
-            "signal_details": sig_meta,
-        })
+    sample_losses = [_format_trade_sample(t) for t in losses[:15]]
+    sample_wins = [_format_trade_sample(t) for t in wins[:10]]
 
     summary_data = {
         "total_trades": len(trades),
         "wins_count": len(wins),
         "losses_count": len(losses),
         "sample_losses": sample_losses,
+        "sample_wins": sample_wins,
     }
 
     system_prompt = (
@@ -424,9 +579,9 @@ def stage_llama_redteam(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Stage 2: Llama 3.3 (70B) Adversarial Red-Team & Combine Risk Audit."""
     if not ping_ollama():
-        logger.warning("Ollama is not running. Bypassing Llama red-team stage.")
+        logger.warning("Llama router is not running. Bypassing Llama red-team stage.")
         return hypotheses, {
-            "redteam_summary": "Ollama offline; bypassed red-team.",
+            "redteam_summary": "Llama router offline; bypassing adversarial audit.",
             "approved_hypotheses": hypotheses,
             "rejected_hypotheses": [],
         }
@@ -465,30 +620,27 @@ def stage_codestral_certify(
     candidate: dict[str, Any],
     model: str = DEFAULT_MODELS["certify"],
 ) -> dict[str, Any]:
-    """Stage 4: Codestral 22B Python Code Contract & Schema Certification."""
+    """Stage 4: Codestral 22B strategy code analyzer & schema contract certifier."""
     strat_name = candidate.get("strategy")
     param_name = candidate.get("parameter")
     param_val = candidate.get("value")
 
-    # Static baseline check first
     if not is_valid_candidate_param(strat_name, param_name):
         return {
             "certified": False,
             "strategy": strat_name,
             "parameter": param_name,
-            "value": param_val,
-            "reason": f"Parameter {param_name} is not whitelisted or read in strategy code.",
+            "reason": f"Parameter '{param_name}' is not whitelisted for tuning.",
             "code_signature_verified": False,
         }
 
     if not ping_ollama():
-        logger.warning("Ollama is not running. Using deterministic static AST certification.")
+        logger.warning("Llama router is not running. Bypassing certification.")
         return {
             "certified": True,
             "strategy": strat_name,
             "parameter": param_name,
-            "value": param_val,
-            "reason": "Static parameter whitelist verified (Ollama offline).",
+            "reason": "Llama router offline; assuming signature match.",
             "code_signature_verified": True,
         }
 
@@ -536,7 +688,41 @@ def stage_codestral_certify(
         }
 
 
-def get_fallback_hypotheses() -> dict[str, Any]:
+def get_fallback_hypotheses(base_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if base_config is None:
+        try:
+            base_config = load_stack_config(str(CONFIG_FILE))
+        except Exception:
+            base_config = None
+
+    base_adx = 25.0
+    base_sl = 1.5
+    if isinstance(base_config, dict):
+        for spec in (base_config.get("strategies", {}) or {}).get("strategies", []):
+            if isinstance(spec, dict) and spec.get("name") == "mtf_trend_scalper":
+                params = spec.get("params", {})
+                if isinstance(params, dict):
+                    sym_params = params.get("symbol_params", {})
+                    found_adx = False
+                    found_sl = False
+                    if isinstance(sym_params, dict):
+                        for sym_cfg in sym_params.values():
+                            if isinstance(sym_cfg, dict):
+                                if not found_adx and "min_adx" in sym_cfg:
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        base_adx = float(sym_cfg["min_adx"])
+                                        found_adx = True
+                                if not found_sl and "sl_atr_mult" in sym_cfg:
+                                    with contextlib.suppress(ValueError, TypeError):
+                                        base_sl = float(sym_cfg["sl_atr_mult"])
+                                        found_sl = True
+                    if not found_adx and "min_adx" in params:
+                        with contextlib.suppress(ValueError, TypeError):
+                            base_adx = float(params["min_adx"])
+                    if not found_sl and "sl_atr_mult" in params:
+                        with contextlib.suppress(ValueError, TypeError):
+                            base_sl = float(params["sl_atr_mult"])
+
     return {
         "analysis_summary": "Deterministic grid sweep around current production baseline.",
         "identified_flaws": ["Routine weekly parameter neighborhood calibration."],
@@ -544,13 +730,22 @@ def get_fallback_hypotheses() -> dict[str, Any]:
             {
                 "strategy": "mtf_trend_scalper",
                 "parameter": "min_adx",
-                "test_values": [30.0, 33.0, 35.0, 38.0],
+                "test_values": [
+                    round(base_adx - 5.0, 1),
+                    round(base_adx - 2.0, 1),
+                    round(base_adx, 1),
+                    round(base_adx + 3.0, 1),
+                ],
                 "rationale": "Test ADX momentum threshold sensitivity across market volatility shifts.",
             },
             {
                 "strategy": "mtf_trend_scalper",
                 "parameter": "sl_atr_mult",
-                "test_values": [1.3, 1.5, 1.8],
+                "test_values": [
+                    round(max(1.0, base_sl - 0.2), 2),
+                    round(base_sl, 2),
+                    round(base_sl + 0.3, 2),
+                ],
                 "rationale": "Calibrate stop-loss ATR breathing room.",
             },
         ],
@@ -580,6 +775,49 @@ _ORB_ASIAN_PARAM_MIRRORS: dict[str, str] = {
 
 
 _ORB_ASIAN_REVERSE_MIRRORS: dict[str, str] = {v: k for k, v in _ORB_ASIAN_PARAM_MIRRORS.items()}
+
+
+def is_valid_param_value(strategy: str | None, param: str | None, value: Any) -> bool:
+    """Checks whether a parameter value satisfies safety bounds."""
+    if isinstance(value, bool):
+        return False
+    if not strategy or not param:
+        return False
+
+    if param == "allowed_entry_hours_et":
+        if isinstance(value, list):
+            if not value:
+                return False
+            return all(
+                isinstance(h, int) and not isinstance(h, bool) and 0 <= h <= 23
+                for h in value
+            )
+        if isinstance(value, (int, float)):
+            return 0 <= value <= 23
+        return False
+
+    strat_bounds = PARAM_BOUNDS.get(strategy)
+    if not strat_bounds:
+        return False
+
+    bounds = strat_bounds.get(param)
+    if bounds is None:
+        mirror = _ORB_ASIAN_PARAM_MIRRORS.get(param)
+        if mirror:
+            bounds = strat_bounds.get(mirror)
+        else:
+            reverse_mirror = _ORB_ASIAN_REVERSE_MIRRORS.get(param)
+            if reverse_mirror:
+                bounds = strat_bounds.get(reverse_mirror)
+
+    if bounds is None:
+        return False
+
+    if not isinstance(value, (int, float)):
+        return False
+
+    min_val, max_val = bounds
+    return min_val <= float(value) <= max_val
 
 
 def apply_param_override(cfg: dict[str, Any], strategy: str, param: str, value: Any) -> bool:
@@ -631,6 +869,34 @@ def _run_single_symbol(sym: str, path: Path, strat_cfg: dict[str, Any]) -> list[
     return trades
 
 
+def _get_dataset_cutoff_date(holdout_days: int) -> str | None:
+    """Inspects CONTINUOUS_DATA and returns (max_date - timedelta(days=holdout_days)).strftime('%Y-%m-%d')."""
+    max_dt: datetime | None = None
+    for raw_path in CONTINUOUS_DATA.values():
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size == 0:
+                    continue
+                f.seek(max(0, size - 4096), os.SEEK_SET)
+                lines = f.read().decode("utf-8", errors="replace").strip().splitlines()
+                if not lines:
+                    continue
+                ts_str = lines[-1].split(",")[0].strip()
+                dt = datetime.fromisoformat(ts_str[:10])
+                if max_dt is None or dt > max_dt:
+                    max_dt = dt
+        except Exception as exc:
+            logger.debug(f"Could not extract max date from {path}: {exc}")
+    if max_dt is None:
+        return None
+    return (max_dt - timedelta(days=holdout_days)).strftime("%Y-%m-%d")
+
+
 def evaluate_backtest_candidate(
     config_dict: dict[str, Any], holdout_days: int = 21
 ) -> dict[str, Any]:
@@ -638,7 +904,7 @@ def evaluate_backtest_candidate(
     strat_cfg = get_strategy_config(config_dict)
     portfolio_trades = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CONTINUOUS_DATA)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(CONTINUOUS_DATA))) as executor:
         futures = [
             executor.submit(_run_single_symbol, sym, path, strat_cfg)
             for sym, path in CONTINUOUS_DATA.items()
@@ -647,9 +913,23 @@ def evaluate_backtest_candidate(
             portfolio_trades.extend(f.result())
 
     if not portfolio_trades:
-        return {"total_trades": 0, "profit_factor": 0.0, "total_pnl": 0.0, "holdout_pnl": 0.0}
+        return {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown": 0.0,
+            "in_sample_trades": 0,
+            "in_sample_pnl": 0.0,
+            "in_sample_pf": 0.0,
+            "in_sample_max_drawdown": 0.0,
+            "holdout_pnl": 0.0,
+            "holdout_pf": 0.0,
+            "holdout_trades": 0,
+            "holdout_win_rate": 0.0,
+        }
 
-    portfolio_trades.sort(key=lambda x: str(x.get("time_open", "")))
+    portfolio_trades.sort(key=lambda x: str(x.get("time_close") or x.get("time_open") or ""))
     total_trades = len(portfolio_trades)
     wins = [t for t in portfolio_trades if t.get("pnl", 0) > 0]
     losses = [t for t in portfolio_trades if t.get("pnl", 0) < 0]
@@ -657,31 +937,55 @@ def evaluate_backtest_candidate(
     total_pnl = sum(t.get("pnl", 0) for t in portfolio_trades)
     gross_win = sum(t.get("pnl", 0) for t in wins)
     gross_loss = abs(sum(t.get("pnl", 0) for t in losses))
-    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    pf = min(999.0, gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
 
     cum_pnl = 0.0
     peak_pnl = 0.0
     max_drawdown = 0.0
     for t in portfolio_trades:
-        cum_pnl += t.get("pnl", 0)
-        if cum_pnl > peak_pnl:
-            peak_pnl = cum_pnl
-        dd = peak_pnl - cum_pnl
-        if dd > max_drawdown:
-            max_drawdown = dd
+        mae_dollars = max(0.0, float(t.get("mae_dollars", 0.0) or 0.0))
+        trough_pnl = cum_pnl - mae_dollars
+        max_drawdown = max(max_drawdown, peak_pnl - trough_pnl)
+        cum_pnl += float(t.get("pnl", 0.0) or 0.0)
+        peak_pnl = max(peak_pnl, cum_pnl)
+        max_drawdown = max(max_drawdown, peak_pnl - cum_pnl)
 
     all_dates = sorted({str(t.get("time_open", ""))[:10] for t in portfolio_trades if t.get("time_open")})
-    if len(all_dates) >= holdout_days:
-        cutoff_date = all_dates[-holdout_days]
+    cutoff_date = _get_dataset_cutoff_date(holdout_days)
+    if cutoff_date is None and all_dates:
+        cutoff_date = (datetime.fromisoformat(all_dates[-1]) - timedelta(days=holdout_days)).strftime("%Y-%m-%d")
+
+    if cutoff_date is not None:
         holdout = [t for t in portfolio_trades if str(t.get("time_open", ""))[:10] >= cutoff_date]
         insample = [t for t in portfolio_trades if str(t.get("time_open", ""))[:10] < cutoff_date]
-        holdout_pnl = sum(t.get("pnl", 0) for t in holdout)
-        insample_pnl = sum(t.get("pnl", 0) for t in insample)
-        holdout_wr = sum(1 for t in holdout if t.get("pnl", 0) > 0) / (len(holdout) or 1)
+    else:
+        holdout = []
+        insample = portfolio_trades
+
+    insample_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample)
+    is_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) > 0)
+    is_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in insample if float(t.get("pnl", 0.0) or 0.0) < 0))
+    insample_pf = min(999.0, is_wins / is_losses) if is_losses > 0 else (999.0 if is_wins > 0 else 0.0)
+    is_cum = 0.0
+    is_peak = 0.0
+    insample_mdd = 0.0
+    for t in insample:
+        mae_d = max(0.0, float(t.get("mae_dollars", 0.0) or 0.0))
+        insample_mdd = max(insample_mdd, is_peak - (is_cum - mae_d))
+        is_cum += float(t.get("pnl", 0.0) or 0.0)
+        is_peak = max(is_peak, is_cum)
+        insample_mdd = max(insample_mdd, is_peak - is_cum)
+
+    if holdout:
+        holdout_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout)
+        holdout_wr = sum(1 for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0) / len(holdout)
+        ho_wins = sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) > 0)
+        ho_losses = abs(sum(float(t.get("pnl", 0.0) or 0.0) for t in holdout if float(t.get("pnl", 0.0) or 0.0) < 0))
+        holdout_pf = min(999.0, ho_wins / ho_losses) if ho_losses > 0 else (999.0 if ho_wins > 0 else 0.0)
     else:
         holdout_pnl = 0.0
-        insample_pnl = total_pnl
         holdout_wr = 0.0
+        holdout_pf = 0.0
         holdout = []
 
     return {
@@ -690,11 +994,28 @@ def evaluate_backtest_candidate(
         "total_pnl": round(total_pnl, 2),
         "profit_factor": round(pf, 3),
         "max_drawdown": round(max_drawdown, 2),
+        "in_sample_trades": len(insample),
         "in_sample_pnl": round(insample_pnl, 2),
+        "in_sample_pf": round(insample_pf, 3),
+        "in_sample_max_drawdown": round(insample_mdd, 2),
         "holdout_pnl": round(holdout_pnl, 2),
+        "holdout_pf": round(holdout_pf, 3),
         "holdout_trades": len(holdout),
         "holdout_win_rate": round(holdout_wr, 4),
     }
+
+
+class _QuotedTimeSafeDumper(yaml.SafeDumper):
+    """Ensure HH:MM / HH:MM:SS strings remain quoted so YAML 1.1 never parses them as sexagesimal ints."""
+
+
+def _repr_time_str(dumper: yaml.SafeDumper, data: str):
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", data):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_QuotedTimeSafeDumper.add_representer(str, _repr_time_str)
 
 
 def stage_atomic_config_update(
@@ -729,7 +1050,7 @@ def stage_atomic_config_update(
     tmp_file = CONFIG_FILE.with_suffix(".tmp")
     try:
         with open(tmp_file, "w", encoding="utf-8") as f:
-            yaml.safe_dump(new_config, f, sort_keys=False)
+            yaml.dump(new_config, f, Dumper=_QuotedTimeSafeDumper, sort_keys=False)
     except Exception as e:
         logger.error(f"Failed to write temporary config file: {e}")
         return False
@@ -989,6 +1310,12 @@ def _run_optimizer_locked(
                     elif not isinstance(val, list):
                         continue
 
+                if not is_valid_param_value(strat_name, param_name, val):
+                    logger.warning(
+                        f"Rejecting candidate value {strat_name}.{param_name}={val}: outside safety bounds."
+                    )
+                    continue
+
                 candidate_id = f"{strat_name}.{param_name}={val}"
                 if any(r.get("candidate_id") == candidate_id for r in eval_results):
                     continue
@@ -1000,6 +1327,7 @@ def _run_optimizer_locked(
                     continue
 
                 cand_metrics = evaluate_backtest_candidate(test_cfg)
+                gc.collect()
                 if all(cand_metrics.get(k) == base_metrics.get(k) for k in ("total_trades", "total_pnl", "profit_factor", "max_drawdown")):
                     logger.warning(f"Candidate {candidate_id} produced results identical to baseline (no effect).")
                     cand_metrics["no_effect"] = True
@@ -1025,47 +1353,62 @@ def _run_optimizer_locked(
         mgr.update_phase("VALIDATION_GATE")
 
     # Phase 6: Validation Gate & Selection
+    # Strictly separate In-Sample ranking from Out-of-Sample (21-day holdout) confirmation
+    # to eliminate holdout snooping / data leakage.
     if mgr.state["phase"] == "VALIDATION_GATE":
-        logger.info("Evaluating candidates against strict validation gates...")
-        best_candidate = None
-        base_pf = base_metrics.get("profit_factor", 1.25)
+        logger.info("Evaluating candidates against strict in-sample ranking + holdout confirmation gates...")
+        best_in_sample = None
+        base_is_pf = base_metrics.get("in_sample_pf", base_metrics.get("profit_factor", 1.25))
+        base_is_pnl = base_metrics.get("in_sample_pnl", base_metrics.get("total_pnl", 0.0))
+        base_is_mdd = base_metrics.get("in_sample_max_drawdown", base_metrics.get("max_drawdown", 1000.0))
         base_holdout = base_metrics.get("holdout_pnl", 0.0)
-        base_mdd = base_metrics.get("max_drawdown", 1000.0)
-        base_trades = int(base_metrics.get("total_trades", 0) or 0)
-        min_required_trades = min(80, max(min(40, base_trades), int(base_trades * 0.75))) if base_trades > 0 else 40
-        logger.info(f"Validation gate minimum trade threshold: {min_required_trades} trades (baseline={base_trades})")
+        base_is_trades = int(base_metrics.get("in_sample_trades", base_metrics.get("total_trades", 0)) or 0)
+        min_required_is_trades = min(80, max(min(40, base_is_trades), int(base_is_trades * 0.75))) if base_is_trades > 0 else 40
+        logger.info(f"Validation gate minimum in-sample trade threshold: {min_required_is_trades} trades (baseline IS={base_is_trades})")
         if eval_results:
             no_effect_rate = sum(1 for r in eval_results if r.get("no_effect")) / len(eval_results)
             if no_effect_rate > 0.5:
                 logger.warning(f"High no_effect rate ({no_effect_rate:.1%}) in candidate sweep — review parameter mappings.")
 
+        max_allowed_is_mdd = max(base_is_mdd * 1.15, 600.0)
         for cand in eval_results:
-            pf = cand.get("profit_factor", 0.0)
-            holdout_pnl = cand.get("holdout_pnl", 0.0)
-            total_trades = cand.get("total_trades", 0)
-            cand_mdd = cand.get("max_drawdown", float("inf"))
+            is_pf = cand.get("in_sample_pf", cand.get("profit_factor", 0.0))
+            is_pnl = cand.get("in_sample_pnl", cand.get("total_pnl", 0.0))
+            is_mdd = cand.get("in_sample_max_drawdown", cand.get("max_drawdown", float("inf")))
+            is_trades = int(cand.get("in_sample_trades", cand.get("total_trades", 0)) or 0)
 
-            max_allowed_mdd = max(base_mdd * 1.15, 600.0)
             if (
                 not cand.get("no_effect")
-                and pf >= 1.25
-                and pf >= base_pf
-                and holdout_pnl > 0
-                and holdout_pnl >= base_holdout
-                and total_trades >= min_required_trades
-                and cand_mdd <= max_allowed_mdd
-                and (pf, holdout_pnl, -cand_mdd) > (base_pf, base_holdout, -base_mdd)
+                and is_pf >= 1.25
+                and is_pf >= base_is_pf
+                and is_pnl > 0
+                and is_trades >= min_required_is_trades
+                and is_mdd <= max_allowed_is_mdd
+                and (is_pf, is_pnl, -is_mdd) > (base_is_pf, base_is_pnl, -base_is_mdd)
             ):
-                if best_candidate is None or (
-                    (pf, holdout_pnl, total_trades, -cand_mdd)
+                if best_in_sample is None or (
+                    (is_pf, is_pnl, is_trades, -is_mdd)
                     > (
-                        best_candidate["profit_factor"],
-                        best_candidate.get("holdout_pnl", 0.0),
-                        best_candidate.get("total_trades", 0),
-                        -best_candidate.get("max_drawdown", float("inf")),
+                        best_in_sample.get("in_sample_pf", best_in_sample.get("profit_factor", 0.0)),
+                        best_in_sample.get("in_sample_pnl", best_in_sample.get("total_pnl", 0.0)),
+                        int(best_in_sample.get("in_sample_trades", best_in_sample.get("total_trades", 0)) or 0),
+                        -best_in_sample.get("in_sample_max_drawdown", best_in_sample.get("max_drawdown", float("inf"))),
                     )
                 ):
-                    best_candidate = cand
+                    best_in_sample = cand
+
+        best_candidate = None
+        if best_in_sample is not None:
+            ho_pnl = best_in_sample.get("holdout_pnl", 0.0)
+            ho_pf = best_in_sample.get("holdout_pf", best_in_sample.get("profit_factor", 0.0))
+            ho_floor = (base_holdout * 0.85) if base_holdout > 0 else base_holdout
+            if ho_pnl > 0 and ho_pf >= 1.05 and ho_pnl >= ho_floor:
+                best_candidate = best_in_sample
+            else:
+                logger.info(
+                    f"Top in-sample finalist {best_in_sample.get('candidate_id')} failed 21-day OOS holdout gate "
+                    f"(Holdout PnL=${ho_pnl:+.2f} < floor ${ho_floor:+.2f}, PF={ho_pf:.2f}); retaining baseline."
+                )
 
         if best_candidate:
             logger.info(
@@ -1110,7 +1453,11 @@ def _run_optimizer_locked(
                 f"Baseline: PF={base_metrics['profit_factor']:.2f}, Holdout=${base_metrics['holdout_pnl']:+7.2f}\n"
                 f"Candidate: PF={winner['profit_factor']:.2f}, Holdout=${winner['holdout_pnl']:+7.2f}\n"
             )
-            stage_atomic_config_update(promoted_cfg, summary, dry_run=dry_run)
+            promoted_ok = stage_atomic_config_update(promoted_cfg, summary, dry_run=dry_run)
+            if not promoted_ok:
+                logger.warning(f"Config promotion skipped/aborted for {winner.get('candidate_id')}; keeping baseline active.")
+                mgr.state["promoted_candidate"] = None
+                winner = None
 
         generate_optimization_report(
             mgr.state,

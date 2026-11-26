@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -75,6 +77,7 @@ class SupervisorAgent:
         self.client = ProjectXClient()
         if self.account_id and str(self.account_id).isdigit():
             self.client.account_id = int(self.account_id)
+        self.client._last_stop_coverage = {}
         self.risk_agent = RiskAgent(account_id)
         self.execution_agent = ExecutionAgent(self.client)
         self.news_agent = NewsAgent()
@@ -130,6 +133,7 @@ class SupervisorAgent:
         # and does NOT re-trigger the emergency flatten on every subsequent tick.
         self._risk_halt: bool = False
         self._session_reset_done: bool = False  # True once we've reset for the current maintenance window
+        self._preopen_streams_ready: bool = False
         self._session_opening_balance: Decimal | None = None
         self._balance_persistence_path = Path("logs/session_opening_balance.json")
         self._restore_balance_persistence()
@@ -151,30 +155,35 @@ class SupervisorAgent:
         self._optimizer_failures: int = 0
         self._optimizer_next_retry_at: float = 0.0
         try:
-            with open("logs/bot_status.json", "r") as f:
+            with open("logs/bot_status.json") as f:
                 last_status = json.load(f)
-                if str(last_status.get("account_id")) == str(self.account_id):
-                    self._pnl_history = last_status.get("pnl_history", [])
-                    recent = last_status.get("session_trades", last_status.get("recent_trades", []))
-                    session_start_utc = self.get_current_session_start_utc()
-                    
-                    valid_session_trades = []
-                    for t in reversed(recent):
-                        ts_str = t.get("timestamp")
-                        if ts_str:
-                            try:
-                                trade_dt = datetime.fromisoformat(ts_str)
-                                if trade_dt >= session_start_utc:
-                                    valid_session_trades.append(t)
-                            except Exception:
-                                pass
-                    self._recent_trades = valid_session_trades
-                else:
-                    self.logger.info(f"Account ID changed from '{last_status.get('account_id')}' to '{self.account_id}'. Clearing old session history.")
-                    self._pnl_history = []
-                    self._recent_trades = []
-        except Exception:
-            pass
+                if isinstance(last_status, dict):
+                    if str(last_status.get("account_id")) == str(self.account_id):
+                        self._pnl_history = last_status.get("pnl_history", [])
+                        recent = last_status.get("session_trades", last_status.get("recent_trades", []))
+                        if not isinstance(recent, list):
+                            recent = []
+                        session_start_utc = self.get_current_session_start_utc()
+
+                        valid_session_trades = []
+                        for t in reversed(recent):
+                            if not isinstance(t, dict):
+                                continue
+                            ts_str = t.get("timestamp")
+                            if ts_str:
+                                try:
+                                    trade_dt = datetime.fromisoformat(ts_str)
+                                    if trade_dt >= session_start_utc:
+                                        valid_session_trades.append(t)
+                                except (ValueError, TypeError):
+                                    continue
+                        self._recent_trades = valid_session_trades
+                    else:
+                        self.logger.info(f"Account ID changed from '{last_status.get('account_id')}' to '{self.account_id}'. Clearing old session history.")
+                        self._pnl_history = []
+                        self._recent_trades = []
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as e:
+            self.logger.debug(f"Could not load initial bot_status.json: {e}")
 
         # Restore recent/session trades from persistent database
         if self.database and self.database.connected:
@@ -189,8 +198,8 @@ class SupervisorAgent:
                             trade_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                             if trade_dt >= session_start_utc:
                                 valid_session.append(t)
-                        except Exception:
-                            pass
+                        except (ValueError, TypeError):
+                            continue
                 if valid_session:
                     self._recent_trades = valid_session
                 elif not self._recent_trades and db_trades:
@@ -212,6 +221,10 @@ class SupervisorAgent:
         self._latest_broker_positions_snapshot = {}
         self._latest_broker_positions_at = 0.0
         self._last_stall_reconnect_at = 0.0
+        self._reconnect_backoff_secs = 10.0
+        self._next_reconnect_at = 0.0
+        self._order_filled_qty: dict[str, int] = {}
+        self._db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="swarm-db")
         self._last_bracket_guard_at = 0.0
         self._stop_placement_in_flight: dict[str, float] = {}
         self._started_at = time.time()
@@ -249,8 +262,8 @@ class SupervisorAgent:
                                         trade_dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                                         if trade_dt >= session_start_utc:
                                             valid_session.append(t)
-                                    except Exception:
-                                        pass
+                                    except (ValueError, TypeError):
+                                        continue
                             if valid_session:
                                 self._recent_trades = valid_session
                             elif not self._recent_trades:
@@ -318,6 +331,8 @@ class SupervisorAgent:
             status = self.client.get_account_status()
             if status:
                 balance = status.get("balance", 0)
+                if self._session_opening_balance is not None and float(self._session_opening_balance) > 0 and balance:
+                    self._session_pnl_from_fills = float(Decimal(str(balance)) - self._session_opening_balance)
                 pnl = status.get("dailyPnL")  # None when absent — preserves fill-accumulated P&L
                 mll = status.get("minimumBalance")
                 self.risk_agent.update_account_state(
@@ -488,6 +503,67 @@ class SupervisorAgent:
         self._warmup_complete = True
         await self.run()
 
+    @staticmethod
+    def _seconds_until_next_globex_open(now_dt: datetime) -> float | None:
+        """Return seconds until 18:00 ET Globex open when currently inside a pre-open maintenance/Sunday window."""
+        try:
+            import zoneinfo
+            et_tz = zoneinfo.ZoneInfo("America/New_York")
+            dt_utc = now_dt if now_dt.tzinfo is not None else now_dt.replace(tzinfo=timezone.utc)
+            dt_et = dt_utc.astimezone(et_tz)
+            wd = dt_et.weekday()
+            # Mon-Thu 17:00-18:00 ET or Sunday before 18:00 ET
+            if (wd in (0, 1, 2, 3) and dt_et.hour == 17) or (wd == 6 and dt_et.hour < 18):
+                open_et = dt_et.replace(hour=18, minute=0, second=0, microsecond=0)
+                secs = (open_et - dt_et).total_seconds()
+                return max(0.0, secs)
+        except Exception:
+            return None
+        return None
+
+    async def _prepare_session_open_streams(self, last_processed_bar_count: dict[str, int]) -> None:
+        """Resolve contract rollovers, reconnect SignalR streams, and backfill bars ahead of 18:00 ET open."""
+        self.client.last_tick_at = time.time()
+        for base_sym, old_off in list(getattr(self, "symbol_map", {}).items()):
+            if not self.active_positions.get(old_off):
+                try:
+                    new_off = await self.loop.run_in_executor(None, self.client.resolve_symbol, base_sym)
+                    if new_off and new_off != old_off:
+                        self.logger.warning(f"[CONTRACT ROLLOVER] {base_sym} rolled from {old_off} -> {new_off}")
+                        self.symbol_map[base_sym] = new_off
+                        if old_off in self.official_symbols:
+                            self.official_symbols = [new_off if s == old_off else s for s in self.official_symbols]
+                        elif new_off not in self.official_symbols:
+                            self.official_symbols.append(new_off)
+                        if old_off in self.data_agents:
+                            dagent = self.data_agents.pop(old_off)
+                            dagent.symbol = new_off
+                            self.data_agents[new_off] = dagent
+                        if old_off in self.strategy_agents:
+                            sagent = self.strategy_agents.pop(old_off)
+                            sagent.symbol = new_off
+                            if hasattr(sagent, "engine") and sagent.engine:
+                                sagent.engine.symbol = new_off
+                            self.strategy_agents[new_off] = sagent
+                        if old_off in self.zone_engines:
+                            zeng = self.zone_engines.pop(old_off)
+                            zeng.symbol = new_off
+                            self.zone_engines[new_off] = zeng
+                        if old_off in last_processed_bar_count:
+                            last_processed_bar_count[new_off] = last_processed_bar_count.pop(old_off)
+                        meta = self.client.get_contract_meta(base_sym)
+                        if meta:
+                            self.risk_agent.register_contract(new_off, meta)
+                except Exception as roll_exc:
+                    self.logger.debug(f"Rollover check skipped for {base_sym}: {roll_exc}")
+        await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
+        self.client.subscribe_market_data(self.official_symbols)
+        await self._smart_sleep(3)
+        await self._refresh_recent_bars(bar_count=120)
+        for sym in self.official_symbols:
+            if sym in self.data_agents:
+                last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
+
     async def run(self):
         self.logger.info("Supervisor swarm initiated...")
 
@@ -497,10 +573,10 @@ class SupervisorAgent:
             on_reconnect=self._on_reconnect_threadsafe
         )
         self.client.setup_user_hub_signalr(self._on_user_event_threadsafe)
-        
+
         # Subscribe to market data quotes for all trading symbols
         self.client.subscribe_market_data(self.official_symbols)
-        
+
         last_processed_bar_count = {sym: self.data_agents[sym].get_bar_count() for sym in self.official_symbols}
 
 
@@ -519,21 +595,12 @@ class SupervisorAgent:
                     self._session_opening_balance = None
                     # Reset tick timestamp so the 90s/300s data stall watchdog doesn't fire immediately
                     self.client.last_tick_at = time.time()
-                    # Check for front-month contract rollover when flat
-                    for base_sym, old_off in list(getattr(self, "symbol_map", {}).items()):
-                        if not self.active_positions.get(old_off):
-                            try:
-                                new_off = await self.loop.run_in_executor(None, self.client.resolve_symbol, base_sym)
-                                if new_off and new_off != old_off:
-                                    self.logger.warning(f"[CONTRACT ROLLOVER] {base_sym} rolled from {old_off} -> {new_off}")
-                            except Exception as roll_exc:
-                                self.logger.debug(f"Rollover check skipped for {base_sym}: {roll_exc}")
-                    await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
-                    self.client.subscribe_market_data(self.official_symbols)
-                    await self._smart_sleep(3)
-                    await self._refresh_recent_bars(bar_count=120)
-                    for sym in self.official_symbols:
-                        last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
+                    if getattr(self, "_preopen_streams_ready", False) and self.client.is_connected and self.client.user_is_connected:
+                        self.logger.info("Pre-open SignalR streams already connected — skipping reconnect to preserve 18:00 ET opening bar.")
+                        self._preopen_streams_ready = False
+                    else:
+                        self._preopen_streams_ready = False
+                        await self._prepare_session_open_streams(last_processed_bar_count)
                     try:
                         acc_status = await self.loop.run_in_executor(None, self.client.get_account_status)
                         if acc_status:
@@ -542,12 +609,13 @@ class SupervisorAgent:
                             mll_val = acc_status.get("minimumBalance")
                             if cur_bal and float(cur_bal) > 0:
                                 self._session_opening_balance = Decimal(str(cur_bal))
+                                self._session_pnl_from_fills = float(Decimal(str(cur_bal)) - self._session_opening_balance)
                             self.risk_agent.update_account_state(
                                 cur_bal, pnl_val, 0, minimum_balance=mll_val, session_opening_balance=self._session_opening_balance
                             )
                     except Exception as exc:
                         self.logger.warning(f"Session transition account sync failed: {exc}")
-                    self._write_status()
+                    self._schedule_status_write()
                     self._last_status_write = time.time()
                     self._eod_triggered = False
 
@@ -558,14 +626,8 @@ class SupervisorAgent:
                 )
                 status_interval = 1 if has_open_position else 5
                 if now_ts - self._last_status_write >= status_interval:
-                    self._write_status()
+                    self._schedule_status_write()
                     self._last_status_write = now_ts
-
-                # RISK HALT: If daily loss/drawdown limit was previously hit this session,
-                # skip all analysis and trade dispatch — bot is halted for the day.
-                if self._risk_halt:
-                    await self._smart_sleep(30)
-                    continue
 
                 # EOD HARD STOP CHECK (4:50 PM ET) — runs BEFORE the market-closed gate
                 # so that the flatten fires even though is_market_hours returns False at 16:50.
@@ -577,17 +639,21 @@ class SupervisorAgent:
                     await self._smart_sleep(60)
                     continue
 
-                # If market is closed, shut down streaming to avoid noise
+                # If market is closed, shut down streaming to avoid noise (except during 2m pre-open warm-up)
                 if not market_open:
+                    secs_to_open = self._seconds_until_next_globex_open(now_dt)
+                    in_preopen_window = secs_to_open is not None and 0.0 < secs_to_open <= 120.0
+
                     # Flush any open 16:59 ET bars before shutting down streams
                     for sym in self.official_symbols:
                         if sym in self.data_agents:
                             self.data_agents[sym].check_bar_expiry(now_dt)
                             last_processed_bar_count[sym] = self.data_agents[sym].get_bar_count()
-                    if self.client.is_connected or self.client.user_is_connected:
+                    if not in_preopen_window and (self.client.is_connected or self.client.user_is_connected):
                         self.logger.info("Market is closed: Shutting down SignalR streaming.")
                         self.client.stop_streaming()
                         self.client.stop_user_streaming()
+                        self._preopen_streams_ready = False
                     self._eod_triggered = False
 
                     # SESSION BOUNDARY RESET (fires once per maintenance window)
@@ -609,23 +675,52 @@ class SupervisorAgent:
                         self.risk_agent.reset_session()
                         self._session_reset_done = True
 
+                    # Pre-connect SignalR 2 minutes before 18:00 ET Globex open so the
+                    # opening minute bar (18:00-18:01 ET) is captured without reconnect gaps.
+                    if in_preopen_window and not getattr(self, "_preopen_streams_ready", False):
+                        self.logger.info("Pre-open warm-up (2m before 18:00 ET Globex): connecting SignalR streams...")
+                        await self._prepare_session_open_streams(last_processed_bar_count)
+                        self._preopen_streams_ready = True
+
                     # Autonomous Saturday Optimization Routine (runs on Saturday morning when flat)
                     await self._check_saturday_optimization()
 
-                    await self._smart_sleep(60)
+                    if secs_to_open is not None:
+                        if in_preopen_window:
+                            sleep_secs = min(5.0, max(0.5, secs_to_open))
+                        else:
+                            sleep_secs = min(60.0, max(1.0, secs_to_open - 120.0))
+                    else:
+                        sleep_secs = 60.0
+                    await self._smart_sleep(sleep_secs)
                     continue
 
-                # Ensure streams are active during market hours
+                # RISK HALT: If daily loss/drawdown limit was previously hit this session,
+                # skip all analysis and trade dispatch — bot is halted for the day.
+                if self._risk_halt:
+                    await self._smart_sleep(30)
+                    continue
+
+                # Ensure streams are active during market hours (exponential backoff prevents auth/429 storms)
                 if not self.client.is_connected or not self.client.user_is_connected:
-                    self.logger.warning("Market session active but SignalR stream(s) disconnected. Re-initializing...")
-                    await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=True))
-                    self.client.subscribe_market_data(self.official_symbols)
-                    await self._smart_sleep(3)
-                    await self._refresh_recent_bars(bar_count=60)
-                    self._eod_triggered = False
+                    if now_ts >= getattr(self, "_next_reconnect_at", 0.0):
+                        backoff = float(getattr(self, "_reconnect_backoff_secs", 10.0) or 10.0)
+                        self.logger.warning(
+                            f"Market session active but SignalR stream(s) disconnected. Re-initializing (next backoff={backoff:.0f}s)..."
+                        )
+                        await self.loop.run_in_executor(None, lambda: self.client.reconnect_all_streams(force=False))
+                        self.client.subscribe_market_data(self.official_symbols)
+                        await self._smart_sleep(3)
+                        await self._refresh_recent_bars(bar_count=60)
+                        self._eod_triggered = False
+                        self._next_reconnect_at = time.time() + backoff
+                        self._reconnect_backoff_secs = min(60.0, backoff * 2.0)
+                else:
+                    self._reconnect_backoff_secs = 10.0
+                    self._next_reconnect_at = 0.0
 
                 if now_ts - self._last_account_poll >= 30:
-                    # Heartbeat Sync: Every 30s we poll account status. 
+                    # Heartbeat Sync: Every 30s we poll account status.
                     # Every 300s (5m) we specifically log it as a heartbeat sync.
                     is_heartbeat = (now_ts - self._last_full_rest_sync >= 300)
                     if is_heartbeat:
@@ -644,6 +739,8 @@ class SupervisorAgent:
                     status = await self.loop.run_in_executor(None, self.client.get_account_status)
                     if status:
                         balance = status.get("balance", 0)
+                        if self._session_opening_balance is not None and float(self._session_opening_balance) > 0:
+                            self._session_pnl_from_fills = float(Decimal(str(balance)) - self._session_opening_balance)
                         pnl = status.get("dailyPnL")  # None when absent — preserves fill-accumulated P&L
                         mll = status.get("minimumBalance")
                         async with self._lock:
@@ -658,7 +755,7 @@ class SupervisorAgent:
 
                 now_dt = datetime.now(timezone.utc)
                 for sym in self.official_symbols:
-                    self.data_agents[sym].check_bar_expiry(now_dt)
+                    self.data_agents[sym].check_bar_expiry(now_dt, grace_seconds=2.0)
                     current_bar_count = self.data_agents[sym].get_bar_count()
                     if current_bar_count <= last_processed_bar_count[sym]:
                         continue
@@ -750,7 +847,7 @@ class SupervisorAgent:
 
     async def _refresh_recent_bars(self, bar_count=120):
         """Backfill recent bars via REST API to ensure data agents and strategies stay current."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(minutes=bar_count + 15)
         symbol_map = getattr(self, "symbol_map", {})
@@ -815,29 +912,48 @@ class SupervisorAgent:
                 except Exception as exc:
                     self.logger.error(f"[DATA WATCHDOG] Reconnect error: {exc}")
 
-        # Mandatory emergency flatten if stall > 300s AND there are open positions
+        # Mandatory emergency flatten if stall > 300s AND there are open positions not already closing
         if last_tick > 0 and (now_ts - last_tick) > 300:
             should_flatten = False
             async with self._lock:
-                total_pos = sum(len(v) for v in self.active_positions.values())
-                if total_pos > 0:
-                    should_flatten = True
+                should_flatten = any(
+                    plist and not self._close_in_flight.get(sym)
+                    for sym, plist in self.active_positions.items()
+                )
             if should_flatten:
                 self.logger.critical("DATA STALL DETECTED: No ticks for 300s with open positions. MANDATORY FLATTEN ALL triggered for security.")
                 await self._flatten_all_emergency()
 
         current_prices = {}
+        bar_extremes = {}
         for sym, dagent in self.data_agents.items():
             lb = dagent.get_latest_data()
             if not lb.empty:
-                current_prices[sym] = lb.iloc[-1]["close"]
+                last_row = lb.iloc[-1]
+                c_price = float(last_row["close"])
+                current_prices[sym] = c_price
+                bar_extremes[sym] = (
+                    float(last_row.get("high", c_price)),
+                    float(last_row.get("low", c_price)),
+                    c_price,
+                )
+        self._update_active_positions_excursions(bar_extremes)
         self.risk_agent.update_unrealized_pnl(current_prices)
 
         for sym in self.official_symbols:
             self.risk_agent.check_pending_timeout(sym)
 
         # Bracket Guard Watchdog: Every 30s, verify all active positions have a working protective stop order
-        if now_ts - getattr(self, "_last_bracket_guard_at", 0) >= 30:
+        # Only run when live trading + API order brackets are enabled (simulation / server-side Position Brackets have no API stops).
+        exec_mode = getattr(getattr(self, "execution_agent", None), "mode", None) or os.getenv("MODE", "simulation").strip().lower()
+        use_brackets = os.getenv("USE_ORDER_BRACKETS", "true").strip().lower() == "true"
+        live_switch = os.getenv("ACTUAL_LIVE_TRADING", "false").strip().lower() == "true"
+        if (
+            exec_mode == "live"
+            and live_switch
+            and use_brackets
+            and now_ts - getattr(self, "_last_bracket_guard_at", 0) >= 30
+        ):
             self._last_bracket_guard_at = now_ts
             async with self._lock:
                 open_items = [
@@ -881,9 +997,10 @@ class SupervisorAgent:
         if self.news_agent.is_near_close(now_dt, lead_minutes=15):
             should_flatten = False
             async with self._lock:
-                total_pos = sum(len(v) for v in self.active_positions.values())
-                if total_pos > 0:
-                    should_flatten = True
+                should_flatten = any(
+                    plist and not self._close_in_flight.get(sym)
+                    for sym, plist in self.active_positions.items()
+                )
             if should_flatten:
                 self.logger.critical("TOPSTEP SAFETY: Proactive EOD Flatten (15m before close) triggered.")
                 await self._flatten_all_emergency()
@@ -902,6 +1019,7 @@ class SupervisorAgent:
 
         # 1. Fetch AUTHORITATIVE state from broker REST (never rely on internal state here)
         broker_active_syms = set()
+        broker_flattened_syms = set()
         fetch_failed = False
         try:
             broker_positions = await self.loop.run_in_executor(None, self.client.get_positions)
@@ -920,7 +1038,12 @@ class SupervisorAgent:
                     if pos_type == 0 or qty == 0:
                         self.logger.info(f"Emergency Flatten: {sym} appears flat at broker (type={pos_type}, size={qty}) — skipping.")
                         continue
-                    
+
+                    if self._close_in_flight.get(sym):
+                        self.logger.info(f"Emergency Flatten: {sym} flatten already in flight — skipping duplicate close order.")
+                        broker_flattened_syms.add(sym)
+                        continue
+
                     broker_active_syms.add(sym)
                     side = "Buy" if pos_type == 1 else "Sell"
 
@@ -937,16 +1060,18 @@ class SupervisorAgent:
                     res = await self.loop.run_in_executor(
                         None, self.execution_agent.flatten_position, sym, qty, side
                     )
-                    
+
                     if res and res.get("status") in ("error", "rejected"):
                         self.logger.error(f"Emergency Flatten: Execution FAILED for {sym}. Keeping internal tracking active.")
                         # Remove from close_in_flight so sync can attempt adoption/recovery if needed
                         self._close_in_flight.pop(sym, None)
                         self._close_in_flight_since.pop(sym, None)
                         continue
-                    
-                    # Flatten succeeded (or at least order was sent)
+
+                    # Flatten order accepted — keep internal position under _close_in_flight
+                    # so GatewayUserPosition (netSize=0) + GatewayUserTrade attribute realized PnL cleanly.
                     broker_active_syms.discard(sym)
+                    broker_flattened_syms.add(sym)
 
                     # Give the broker time to process before checking next position
                     await asyncio.sleep(2)
@@ -965,7 +1090,9 @@ class SupervisorAgent:
                 )
                 async with self._lock:
                     internal_to_flatten = [
-                        (sym, list(plist)) for sym, plist in self.active_positions.items() if plist
+                        (sym, list(plist))
+                        for sym, plist in self.active_positions.items()
+                        if plist and not self._close_in_flight.get(sym)
                     ]
                 for sym, plist in internal_to_flatten:
                     tot_qty = sum(p["qty"] for p in plist)
@@ -985,10 +1112,11 @@ class SupervisorAgent:
             return
 
         async with self._lock:
-            # We don't just clear everything anymore; we check broker truth at start of loop.
-            # But for safety, ensure RiskAgent is aware of the current state.
+            # Clear internal tracking ONLY for symbols already flat on the broker.
+            # Symbols with a flatten order in flight remain guarded until GatewayUserPosition
+            # (netSize=0) + GatewayUserTrade attribute their realized PnL (with 30s auto-expiry fallback).
             for sym in self.official_symbols:
-                if sym not in broker_active_syms:
+                if sym not in broker_active_syms and sym not in broker_flattened_syms:
                     self.active_positions[sym] = []
                     with self.risk_agent._lock:
                         self.risk_agent.open_positions[sym] = []
@@ -999,10 +1127,7 @@ class SupervisorAgent:
             self._latest_broker_positions_at = time.time()
             self.risk_agent.current_pos_count = sum(len(v) for v in self.active_positions.values())
             self.logger.info("Emergency Flatten: Internal position tracking reconciliation complete.")
-            try:
-                self._write_status()
-            except Exception as e:
-                self.logger.debug(f"Status flush after emergency flatten failed: {e}")
+        self._schedule_status_write()
 
     def _on_market_data_threadsafe(self, message):
         self.loop.call_soon_threadsafe(self.on_global_market_data, message)
@@ -1083,20 +1208,25 @@ class SupervisorAgent:
                     sym = self._resolve_symbol_from_payload(data)
                     if sym:
                         self._pending_fill_pnl[sym] = self._pending_fill_pnl.get(sym, 0.0) + pnl_f
-                        # Retroactive race check: If sym is flat internally and the most recent trade
+                        # Retroactive race check: If sym is flat internally and a recent trade
                         # closed within the last 5 seconds with 0.0 PnL, update that trade now so
                         # pnl is not stranded in _pending_fill_pnl.
                         if not self.active_positions.get(sym) and self._recent_trades:
-                            last_trade = self._recent_trades[-1]
-                            if (
-                                last_trade.get("symbol") == sym
-                                and float(last_trade.get("pnl", 0.0)) == 0.0
-                                and time.time() - self._recently_closed.get(sym, 0) < 5.0
-                            ):
+                            fill_oid = str(data.get("orderId") or "")
+                            matched_trade = None
+                            for cand in reversed(self._recent_trades[-5:]):
+                                if cand.get("symbol") != sym or float(cand.get("pnl", 0.0)) != 0.0:
+                                    continue
+                                if fill_oid and cand.get("order_id") and str(cand.get("order_id")) == fill_oid:
+                                    matched_trade = cand
+                                    break
+                                if matched_trade is None:
+                                    matched_trade = cand
+                            if matched_trade is not None and time.time() - self._recently_closed.get(sym, 0) < 5.0:
                                 self.logger.info(
                                     f"[USER-HUB FILL] Retroactively attributing ${pnl_f:.2f} to recently closed {sym} trade."
                                 )
-                                last_trade["pnl"] = round(pnl_f, 2)
+                                matched_trade["pnl"] = round(pnl_f, 2)
                                 self._pending_fill_pnl.pop(sym, None)
                                 self._last_trade_won[sym] = pnl_f > 0
                                 if pnl_f > 0:
@@ -1106,15 +1236,15 @@ class SupervisorAgent:
                                     self._notify_strategy_stop_exit(sym)
                                 try:
                                     self.risk_agent.record_trade_result(pnl_f, symbol=sym)
-                                except Exception:
-                                    pass
-                                if last_trade.get("trade_key"):
+                                except Exception as e:
+                                    self.logger.debug(f"record_trade_result skipped for {sym}: {e}")
+                                if matched_trade.get("trade_key"):
                                     self._persist_closed_trade_outcome(
                                         symbol=sym,
-                                        closed=last_trade,
+                                        closed=matched_trade,
                                         pnl=pnl_f,
-                                        order_type=last_trade.get("type", "retroactive_fill"),
-                                        session=last_trade.get("session"),
+                                        order_type=matched_trade.get("type", "retroactive_fill"),
+                                        session=matched_trade.get("session"),
                                     )
 
                     prev_fills_pnl = self._session_pnl_from_fills
@@ -1148,10 +1278,7 @@ class SupervisorAgent:
                     self.risk_agent.update_account_state(
                         float(balance), pnl, open_pos_count, minimum_balance=mll, session_opening_balance=self._session_opening_balance
                     )
-                    try:
-                        self._write_status()
-                    except Exception:
-                        pass
+                    self._schedule_status_write()
                 return
         except Exception as e:
             self.logger.error(f"on_user_event({event_type}) error: {e}")
@@ -1188,6 +1315,9 @@ class SupervisorAgent:
                         target_data = dict(data)
                         target_data["symbol"] = sym
                     self.data_agents[sym].handle_market_data(target_data)
+                    t_price = self._safe_float(target_data.get("price"))
+                    if t_price > 0 and self.active_positions.get(sym):
+                        self._update_active_positions_excursions({sym: (t_price, t_price, t_price)})
         except Exception as e:
             self.logger.error(f"Broadcasting error: {e}")
 
@@ -1207,7 +1337,7 @@ class SupervisorAgent:
             # so downstream string comparisons work and we never crash on .lower().
             order_status = normalize_status(data.get("status"))
             order_type = normalize_order_type(data.get("type"))
-            
+
             # Use the most accurate execution data available
             fill_price = self._safe_float(
                 data.get("fillPrice") or data.get("averagePrice") or data.get("entryPrice") or data.get("price") or 0.0
@@ -1234,8 +1364,10 @@ class SupervisorAgent:
                     # strategies can apply their fresh-close re-entry gate.
                     if close_type == "sl":
                         self._notify_strategy_stop_exit(symbol)
-                    # FIX: Clear close-in-flight flag now that broker has confirmed flat.
-                    self._close_in_flight.pop(symbol, None)
+                    # Keep close-in-flight active until _handle_position_close_update acquires
+                    # self._lock and drains active_positions (prevents 250ms TOCTOU stop race).
+                    self._close_in_flight[symbol] = True
+                    self._close_in_flight_since[symbol] = time.time()
                     # Signal to Case B that a drain is already queued for this symbol
                     # so it does not schedule a second _handle_position_close_update.
                     self._drain_queued[symbol] = True
@@ -1248,11 +1380,29 @@ class SupervisorAgent:
                 asyncio.ensure_future(self._handle_position_open_update(symbol, side, qty, fill_price))
                 return
 
-            # Case B: Standard Order Fill
-            if order_status in ("filled", "completed", "executed", "2", "3"): # Handle numeric status too (2=filled, 3=completed)
-                qty_raw = data.get("filledQty") or data.get("size") or data.get("fillVolume") or 0
-                qty = int(abs(self._safe_float(qty_raw)))
-                
+            # Case B: Standard Order Fill (including partial fills status=7; never status=3 cancelled)
+            if order_status in ("filled", "completed", "executed", "partially_filled", "2", "7"):
+                is_partial_status = order_status in ("partially_filled", "7")
+                cum_raw = data.get("fillVolume")
+                if cum_raw is None:
+                    cum_raw = data.get("filledQty")
+                if cum_raw is None and not is_partial_status:
+                    cum_raw = data.get("size")
+                cum_qty = int(abs(self._safe_float(cum_raw or 0)))
+                oid_raw = data.get("id") or data.get("orderId")
+                if oid_raw is not None:
+                    if not hasattr(self, "_order_filled_qty"):
+                        self._order_filled_qty = {}
+                    oid_key = str(oid_raw)
+                    prev_filled = int(self._order_filled_qty.get(oid_key, 0))
+                    qty = max(0, cum_qty - prev_filled)
+                    self._order_filled_qty[oid_key] = max(prev_filled, cum_qty)
+                    if len(self._order_filled_qty) > 1000:
+                        for old_k in list(self._order_filled_qty.keys())[:500]:
+                            self._order_filled_qty.pop(old_k, None)
+                else:
+                    qty = cum_qty
+
                 if qty > 0:
                     self.logger.info(f"[LEDGER FILL] {symbol} {order_status.upper()} {qty}x @ {fill_price}")
                     # 4=stoploss, 1=takeprofit/limit
@@ -1352,6 +1502,12 @@ class SupervisorAgent:
             if isinstance(result, RouterRejection):
                 self.health_monitor.record_signal(sym, False, result.reason)
                 self.logger.info(f"[ROUTER REJECT] {sym}: {result.stage} {result.reason}")
+
+                strategy_agent = self.strategy_agents.get(sym)
+                engine = getattr(strategy_agent, "engine", None)
+                for strat in getattr(engine, "strategies", None) or []:
+                    if getattr(strat, "name", None) == trade_intent.get("strategy_name") and callable(getattr(strat, "on_signal_rejected", None)):
+                        strat.on_signal_rejected(trade_intent)
                 return
 
             self.health_monitor.record_signal(sym, True, result.reason)
@@ -1414,18 +1570,18 @@ class SupervisorAgent:
     def _record_position_open(self, sym, trade_intent, quantity, execution_price, order_id=None, trade_key=None):
         self.last_signal_time[sym] = time.time()
         self._drain_queued.pop(sym, None)
-        
+
         # FIX: Net-Position Awareness & Desync Prevention
         # If we have existing positions for this symbol, check if they are the opposite side.
         if self.active_positions.get(sym):
             existing_side = self.active_positions[sym][0]["side"]
             new_side = trade_intent["side"]
-            
+
             if existing_side != new_side:
                 # Calculate total existing quantity
                 existing_qty = sum(p["qty"] for p in self.active_positions[sym])
                 self.logger.info(f"[NET POSITION] {sym}: {new_side} {quantity}x against existing {existing_side} {existing_qty}x.")
-                
+
                 if quantity >= existing_qty:
                     # Closing the entire existing position and possibly flipping
                     self.logger.info(f"[NET POSITION] {sym}: Entire {existing_side} position closed.")
@@ -1439,11 +1595,11 @@ class SupervisorAgent:
                                 entry_price = float(closed.get("entry", 0.0))
                                 cside = closed.get("side")
                                 cqty = int(closed.get("qty", 0))
-                                
+
                                 price_diff = (execution_price - entry_price) if cside == "Buy" else (entry_price - execution_price)
                                 ticks = price_diff / tick_size if tick_size > 0 else 0.0
                                 calc_pnl = ticks * tick_value * cqty
-                                
+
                                 self.logger.info(f"[NET POSITION CLOSE] {sym} closed {cside} {cqty}x @ {execution_price} (entry={entry_price}, calc_pnl=${calc_pnl:.2f})")
                                 self._persist_closed_trade_outcome(symbol=sym, closed=closed, pnl=calc_pnl, order_type="flip")
                                 self.risk_agent.record_trade_result(calc_pnl, symbol=sym)
@@ -1475,7 +1631,7 @@ class SupervisorAgent:
                                 self._pending_fill_pnl.pop(sym, None)
                             except Exception as e:
                                 self.logger.error(f"Failed to calculate and persist flip close outcome for {sym}: {e}")
-                    
+
                     remaining_qty = quantity - existing_qty
                     if remaining_qty > 0:
                         self.logger.info(f"[NET POSITION] {sym}: Flipping to {new_side} {remaining_qty}x.")
@@ -1507,11 +1663,11 @@ class SupervisorAgent:
                             entry_price = float(closed.get("entry", 0.0))
                             cside = closed.get("side")
                             cqty = int(closed.get("qty", 0))
-                            
+
                             price_diff = (execution_price - entry_price) if cside == "Buy" else (entry_price - execution_price)
                             ticks = price_diff / tick_size if tick_size > 0 else 0.0
                             calc_pnl = ticks * tick_value * cqty
-                            
+
                             self.logger.info(f"[NET POSITION CLOSE PARTIAL] {sym} closed {cside} {cqty}x @ {execution_price} (entry={entry_price}, calc_pnl=${calc_pnl:.2f})")
                             self._persist_closed_trade_outcome(symbol=sym, closed=closed, pnl=calc_pnl, order_type="flip_partial")
                             self.risk_agent.record_trade_result(calc_pnl, symbol=sym)
@@ -1543,7 +1699,7 @@ class SupervisorAgent:
                             self._pending_fill_pnl.pop(sym, None)
                         except Exception as e:
                             self.logger.error(f"Failed to calculate and persist flip partial close outcome for {sym}: {e}")
-                
+
                 self.risk_agent.set_pending(sym, False)
                 return
 
@@ -1609,25 +1765,31 @@ class SupervisorAgent:
             )
             from src.utils.session_utils import get_trade_session
             session_name = get_trade_session(opened_at_dt)
-            self.database.persist_trade_context(
-                trade_key=trade_key,
-                symbol=sym,
-                strategy_name=trade_intent.get("strategy_name", "unknown"),
-                side=trade_intent.get("side", ""),
-                quantity=int(quantity),
-                order_id=order_id,
-                entry_price=float(execution_price or 0.0),
-                opened_at=opened_at_dt.isoformat(),
-                session=session_name,
-                strategy_params=self._strategy_params_snapshot(sym),
-                selected_signal=dict(trade_intent),
-                candidates=[dict(c) for c in candidates],
-                blender_metadata=dict(blender_metadata),
-                route_context=dict(route_context or {}),
-                discovery_context=dict(discovery_decision or {}),
-                account_snapshot=self._account_risk_snapshot(),
-                chart_artifacts=chart_artifacts,
-            )
+            ctx_kwargs = {
+                "trade_key": trade_key,
+                "symbol": sym,
+                "strategy_name": trade_intent.get("strategy_name", "unknown"),
+                "side": trade_intent.get("side", ""),
+                "quantity": int(quantity),
+                "order_id": order_id,
+                "entry_price": float(execution_price or 0.0),
+                "opened_at": opened_at_dt.isoformat(),
+                "session": session_name,
+                "strategy_params": self._strategy_params_snapshot(sym),
+                "selected_signal": dict(trade_intent),
+                "candidates": [dict(c) for c in candidates],
+                "blender_metadata": dict(blender_metadata),
+                "route_context": dict(route_context or {}),
+                "discovery_context": dict(discovery_decision or {}),
+                "account_snapshot": self._account_risk_snapshot(),
+                "chart_artifacts": chart_artifacts,
+            }
+            loop = getattr(self, "loop", None)
+            db_exec = getattr(self, "_db_executor", None)
+            if loop is not None and hasattr(loop, "is_running") and loop.is_running() and db_exec is not None:
+                loop.run_in_executor(db_exec, lambda kw=ctx_kwargs: self.database.persist_trade_context(**kw))
+            else:
+                self.database.persist_trade_context(**ctx_kwargs)
         except Exception as exc:
             self.logger.warning("[LEARNING CAPTURE] trade context NOT persisted for %s: %s", sym, exc, exc_info=True)
 
@@ -1673,8 +1835,8 @@ class SupervisorAgent:
                     "bracket": getattr(engine, "bracket", {}),
                     "blender": getattr(engine, "blender_config", {}),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"_strategy_params_snapshot fallback for {sym}: {e}")
         return dict(self.strategy_config or {})
 
     def _account_risk_snapshot(self):
@@ -1838,6 +2000,13 @@ class SupervisorAgent:
             if internal_qty == qty and (not internal_positions or internal_side == side):
                 if internal_positions and avg_price > 0 and abs(float(internal_positions[0].get("entry", 0.0)) - avg_price) > 1e-6:
                     internal_positions[0]["entry"] = avg_price
+                    side_norm = str(internal_positions[0].get("side") or "Buy").strip().lower()
+                    if side_norm in ("buy", "long", "0"):
+                        internal_positions[0]["mfe_price"] = max(self._safe_float(internal_positions[0].get("mfe_price"), avg_price), avg_price)
+                        internal_positions[0]["mae_price"] = min(self._safe_float(internal_positions[0].get("mae_price"), avg_price), avg_price)
+                    else:
+                        internal_positions[0]["mfe_price"] = min(self._safe_float(internal_positions[0].get("mfe_price"), avg_price), avg_price)
+                        internal_positions[0]["mae_price"] = max(self._safe_float(internal_positions[0].get("mae_price"), avg_price), avg_price)
                     with self.risk_agent._lock:
                         if self.risk_agent.open_positions.get(symbol):
                             self.risk_agent.open_positions[symbol][0]["entry"] = Decimal(str(avg_price))
@@ -1873,10 +2042,7 @@ class SupervisorAgent:
                 if hasattr(self, "_latest_broker_positions_snapshot"):
                     self._latest_broker_positions_snapshot[symbol] = [{"side": side, "qty": qty, "entry": avg_price}]
                     self._latest_broker_positions_at = time.time()
-                try:
-                    self._write_status()
-                except Exception:
-                    pass
+                self._schedule_status_write()
                 return
 
             preserved_meta = dict(internal_positions[0]) if (internal_positions and internal_side == side) else {}
@@ -1909,10 +2075,7 @@ class SupervisorAgent:
                 self._latest_broker_positions_snapshot[symbol] = [{"side": side, "qty": qty, "entry": pos_entry["entry"]}]
                 self._latest_broker_positions_at = time.time()
             self.logger.info(f"[POSITION SYNC OPEN] {symbol} {side} {qty}x @ {pos_entry['entry']}")
-            try:
-                self._write_status()
-            except Exception:
-                pass
+        self._schedule_status_write()
 
     async def _handle_position_close_update(self, symbol, order_type, pnl, drain=False, qty: int | None = None):
         """Serializes position clear + attribution updates behind the supervisor lock."""
@@ -1948,7 +2111,7 @@ class SupervisorAgent:
             self._recently_closed[symbol] = now_close_ts
             if hasattr(self, "last_signal_time"):
                 self.last_signal_time[symbol] = now_close_ts
-            
+
             # FIX #H4: DRAIN ALL tracked positions ONLY if broker says we are flat (netSize=0)
             # If it's just an individual order fill, we only clear the specific quantity.
             closed = None
@@ -1987,27 +2150,34 @@ class SupervisorAgent:
                         )
                     except Exception as e:
                         self.logger.warning(f"Failed to schedule orphaned order cancellation for {symbol}: {e}")
+                else:
+                    # Partial exit left remaining open contracts: release _close_in_flight
+                    # immediately so bracket/news guards remain active for the open remainder.
+                    self._close_in_flight.pop(symbol, None)
+                    self._close_in_flight_since.pop(symbol, None)
 
+            still_open = bool(self.active_positions.get(symbol))
             if closed:
                 _pnl = float(pnl) if pnl is not None else 0.0
                 try:
                     self.risk_agent.record_trade_result(_pnl, symbol=symbol)
                 except TypeError:
                     self.risk_agent.record_trade_result(_pnl)
-                self._last_trade_won[symbol] = _pnl > 0
-                # Track consecutive losses for streak cooldown escalation.
-                # Breakeven trades (_pnl == 0) are neutral — they don't reset
-                # the streak but also don't increment it.
-                if _pnl > 0:
-                    self._consecutive_losses[symbol] = 0
-                elif _pnl < 0:
-                    self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
-                    streak = self._consecutive_losses[symbol]
-                    if streak >= self.MAX_CONSECUTIVE_LOSSES:
-                        self.logger.warning(
-                            f"LOSS STREAK: {symbol} hit {streak} consecutive losses — "
-                            "tracking for post-session review; no intraday rollback applied."
-                        )
+                if not still_open:
+                    self._last_trade_won[symbol] = _pnl > 0
+                    # Track consecutive losses for streak cooldown escalation.
+                    # Breakeven trades (_pnl == 0) are neutral — they don't reset
+                    # the streak but also don't increment it.
+                    if _pnl > 0:
+                        self._consecutive_losses[symbol] = 0
+                    elif _pnl < 0:
+                        self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
+                        streak = self._consecutive_losses[symbol]
+                        if streak >= self.MAX_CONSECUTIVE_LOSSES:
+                            self.logger.warning(
+                                f"LOSS STREAK: {symbol} hit {streak} consecutive losses — "
+                                "tracking for post-session review; no intraday rollback applied."
+                            )
                 self.telemetry.record_trade_close(
                     symbol,
                     closed.get("strategy_name", "unknown"),
@@ -2020,7 +2190,12 @@ class SupervisorAgent:
                 from src.utils.session_utils import get_trade_session
                 now_utc = datetime.now(timezone.utc)
                 trade_session = (closed or {}).get("session") or get_trade_session((closed or {}).get("time") or now_utc)
-                self._persist_closed_trade_outcome(symbol=symbol, closed=closed, pnl=_pnl, order_type=order_type, session=trade_session)
+                persist_closed = dict(closed)
+                if still_open:
+                    base_tk = persist_closed.get("trade_key") or build_trade_key(symbol, persist_closed.get("order_id"), persist_closed.get("time"))
+                    persist_closed["trade_key"] = f"{base_tk}:part:{int(now_close_ts * 1000)}"
+                self._persist_closed_trade_outcome(symbol=symbol, closed=persist_closed, pnl=_pnl, order_type=order_type, session=trade_session)
+                excursions = self._compute_position_excursions(symbol, closed)
                 self._recent_trades.append({
                     "symbol": symbol,
                     "trade_key": closed.get("trade_key"),
@@ -2028,9 +2203,19 @@ class SupervisorAgent:
                     "pnl": round(_pnl, 2),
                     "type": order_type,
                     "side": closed.get("side", ""),
+                    "entry": closed.get("entry"),
+                    "qty": closed.get("qty"),
+                    "strategy_name": closed.get("strategy_name", "unknown"),
+                    "sl_ticks": closed.get("sl_ticks"),
+                    "tp_ticks": closed.get("tp_ticks"),
+                    "mfe_price": closed.get("mfe_price"),
+                    "mae_price": closed.get("mae_price"),
+                    "reason": closed.get("reason", ""),
+                    "metadata": closed.get("metadata", {}),
                     "time": now_utc.strftime("%m/%d %H:%M"),
                     "timestamp": now_utc.isoformat(),
                     "session": trade_session,
+                    **excursions,
                 })
                 self._recent_trades = self._recent_trades[-20:]
                 self._feed_live_outcome_to_discovery(
@@ -2047,10 +2232,71 @@ class SupervisorAgent:
             else:
                 self.logger.debug(f"Position for {symbol} already cleared; skipping redundant attribution.")
 
-            try:
-                self._write_status()
-            except Exception as e:
-                self.logger.debug(f"Status flush after close failed: {e}")
+        self._schedule_status_write()
+
+    def _update_active_positions_excursions(self, bar_extremes: dict[str, tuple[float, float, float]]) -> None:
+        if not bar_extremes:
+            return
+        for sym, pos_list in list(self.active_positions.items()):
+            extremes = bar_extremes.get(sym)
+            if not extremes or not pos_list:
+                continue
+            high_p, low_p, close_p = extremes
+            for pos in pos_list:
+                entry = self._safe_float(pos.get("entry"))
+                if entry <= 0:
+                    continue
+                mfe_prev = self._safe_float(pos.get("mfe_price"), default=entry)
+                mae_prev = self._safe_float(pos.get("mae_price"), default=entry)
+                side_norm = str(pos.get("side") or "Buy").strip().lower()
+                if side_norm in ("buy", "long", "0"):
+                    pos["mfe_price"] = max(mfe_prev, high_p, close_p)
+                    pos["mae_price"] = min(mae_prev, low_p, close_p)
+                else:
+                    pos["mfe_price"] = min(mfe_prev, low_p, close_p)
+                    pos["mae_price"] = max(mae_prev, high_p, close_p)
+
+    def _compute_position_excursions(self, symbol: str, pos: dict) -> dict[str, float]:
+        if "mfe_ticks" in pos and "mae_ticks" in pos and pos.get("mfe_ticks") is not None:
+            result = {
+                "mfe_price": self._safe_float(pos.get("mfe_price")),
+                "mae_price": self._safe_float(pos.get("mae_price")),
+                "mfe_ticks": self._safe_float(pos.get("mfe_ticks")),
+                "mae_ticks": self._safe_float(pos.get("mae_ticks")),
+            }
+            if "mfe_r" in pos and pos.get("mfe_r") is not None:
+                result["mfe_r"] = self._safe_float(pos.get("mfe_r"))
+            if "mae_r" in pos and pos.get("mae_r") is not None:
+                result["mae_r"] = self._safe_float(pos.get("mae_r"))
+            return result
+        entry = self._safe_float(pos.get("entry"))
+        if entry <= 0:
+            return {}
+        tick_fn = getattr(getattr(self, "risk_agent", None), "get_tick_size", None)
+        raw_tick = tick_fn(symbol) if callable(tick_fn) else 0.25
+        tick_size = self._safe_float(raw_tick, default=0.25)
+        if tick_size <= 0:
+            tick_size = 0.25
+        mfe_price = self._safe_float(pos.get("mfe_price"), default=entry)
+        mae_price = self._safe_float(pos.get("mae_price"), default=entry)
+        side_norm = str(pos.get("side") or "Buy").strip().lower()
+        if side_norm in ("buy", "long", "0"):
+            mfe_ticks = max(0.0, (mfe_price - entry) / tick_size)
+            mae_ticks = max(0.0, (entry - mae_price) / tick_size)
+        else:
+            mfe_ticks = max(0.0, (entry - mfe_price) / tick_size)
+            mae_ticks = max(0.0, (mae_price - entry) / tick_size)
+        result = {
+            "mfe_price": round(mfe_price, 6),
+            "mae_price": round(mae_price, 6),
+            "mfe_ticks": round(mfe_ticks, 2),
+            "mae_ticks": round(mae_ticks, 2),
+        }
+        sl_ticks = self._safe_float(pos.get("sl_ticks"))
+        if sl_ticks > 0:
+            result["mfe_r"] = round(mfe_ticks / sl_ticks, 2)
+            result["mae_r"] = round(mae_ticks / sl_ticks, 2)
+        return result
 
     def _persist_closed_trade_outcome(self, *, symbol, closed, pnl, order_type, session: str | None = None):
         try:
@@ -2061,24 +2307,42 @@ class SupervisorAgent:
             closed_at = datetime.now(timezone.utc).isoformat()
             account_id = closed.get("account_id") or (str(getattr(self, "account_id", None)) if getattr(self, "account_id", None) else None)
             trade_session = session or closed.get("session") or get_trade_session(closed.get("time") or closed_at)
-            self.database.persist_trade_outcome(
-                trade_key=trade_key,
-                symbol=symbol,
-                order_id=closed.get("order_id"),
-                account_id=account_id,
-                session=trade_session,
-                pnl=float(pnl),
-                close_type=str(order_type or ""),
-                closed_at=closed_at,
-                outcome={
+            closed_copy = dict(closed)
+            excursions = self._compute_position_excursions(symbol, closed_copy)
+            if not excursions:
+                for k in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r", "mfe_price", "mae_price"):
+                    if k in closed_copy and closed_copy[k] is not None:
+                        excursions[k] = closed_copy[k]
+            else:
+                for k in ("mfe_ticks", "mae_ticks", "mfe_r", "mae_r", "mfe_price", "mae_price"):
+                    if k not in excursions and k in closed_copy and closed_copy[k] is not None:
+                        excursions[k] = closed_copy[k]
+            closed_copy.update(excursions)
+            outcome_kwargs = {
+                "trade_key": trade_key,
+                "symbol": symbol,
+                "order_id": closed.get("order_id"),
+                "account_id": account_id,
+                "session": trade_session,
+                "pnl": float(pnl),
+                "close_type": str(order_type or ""),
+                "closed_at": closed_at,
+                "outcome": {
                     "account_id": account_id,
-                    "closed_position": dict(closed),
+                    "closed_position": closed_copy,
                     "session": trade_session,
                     "pnl": float(pnl),
                     "close_type": str(order_type or ""),
                     "closed_at": closed_at,
+                    **excursions,
                 },
-            )
+            }
+            loop = getattr(self, "loop", None)
+            db_exec = getattr(self, "_db_executor", None)
+            if loop is not None and hasattr(loop, "is_running") and loop.is_running() and db_exec is not None:
+                loop.run_in_executor(db_exec, lambda kw=outcome_kwargs: self.database.persist_trade_outcome(**kw))
+            else:
+                self.database.persist_trade_outcome(**outcome_kwargs)
         except Exception as exc:
             self.logger.warning("[LEARNING OUTCOME] trade outcome NOT persisted for %s: %s", symbol, exc, exc_info=True)
 
@@ -2185,7 +2449,14 @@ class SupervisorAgent:
                 if hasattr(self, "_stop_placement_in_flight"):
                     self._stop_placement_in_flight[symbol] = now_ts
 
-            has_stop = await self.loop.run_in_executor(None, self.client.has_working_stop_order, symbol, side)
+            try:
+                has_stop = await self.loop.run_in_executor(None, self.client.has_working_stop_order, symbol, side, qty)
+            except TypeError:
+                has_stop = await self.loop.run_in_executor(None, self.client.has_working_stop_order, symbol, side)
+
+            pos_side_norm = str(side).strip().lower()
+            covered_qty = int(getattr(self.client, "_last_stop_coverage", {}).pop((symbol, pos_side_norm), 0) or 0)
+
             if has_stop is True:
                 async with self._lock:
                     if hasattr(self, "_stop_placement_in_flight"):
@@ -2246,16 +2517,48 @@ class SupervisorAgent:
             prec = len(ts_str.split(".")[1]) if "." in ts_str else 0
             stop_price = round(round(stop_price / tick_size) * tick_size, prec)
 
+            # Check if live price has already breached stop_price (a Stop order would be rejected by broker).
+            cur_market_price = 0.0
+            dagent = self.data_agents.get(symbol)
+            latest_df = dagent.get_latest_data() if dagent else None
+            if latest_df is not None and not latest_df.empty:
+                cur_market_price = float(latest_df.iloc[-1]["close"] or 0.0)
+            stop_already_breached = cur_market_price > 0 and (
+                (is_long and cur_market_price <= stop_price)
+                or (not is_long and cur_market_price >= stop_price)
+            )
+            if stop_already_breached:
+                self.logger.critical(
+                    f"[BRACKET GUARD] Market price ({cur_market_price}) already breached stop ({stop_price}) for {symbol} {side} {qty}x — "
+                    "flattening at market instead of placing rejected Stop order."
+                )
+                self._close_in_flight[symbol] = True
+                self._close_in_flight_since[symbol] = time.time()
+                await self.loop.run_in_executor(None, self.execution_agent.flatten_position, symbol, qty, side)
+                return True
+
+            place_qty = (qty - covered_qty) if (0 < covered_qty < qty) else qty
             self.logger.critical(
                 f"[BRACKET GUARD] ⚠️ UNPROTECTED POSITION DETECTED! {symbol} {side} {qty}x @ {entry_p} has NO active stop-loss! "
-                f"Placing emergency protective stop: {stop_side} {qty}x Stop @ {stop_price} ({effective_sl_ticks} ticks)..."
+                f"Placing emergency protective stop: {stop_side} {place_qty}x Stop @ {stop_price} ({effective_sl_ticks} ticks)..."
             )
+
+            exec_agent = getattr(self, "execution_agent", None)
+            exec_mode = getattr(exec_agent, "mode", None) or os.getenv("MODE", "simulation").strip().lower()
+            if exec_mode == "live" and os.getenv("ACTUAL_LIVE_TRADING", "false").strip().lower() != "true":
+                async with self._lock:
+                    if hasattr(self, "_stop_placement_in_flight"):
+                        self._stop_placement_in_flight.pop(symbol, None)
+                self.logger.critical(
+                    f"[BRACKET GUARD] LIVE MODE BLOCK: ACTUAL_LIVE_TRADING is not 'true' — blocking emergency stop for {symbol}."
+                )
+                return False
 
             res = await self.loop.run_in_executor(
                 None,
                 self.client.place_order,
                 symbol,
-                qty,
+                place_qty,
                 stop_side,
                 "Stop",
                 None,  # limit_price
@@ -2274,7 +2577,7 @@ class SupervisorAgent:
                     self._stop_placement_in_flight[symbol] = time.time()
 
             self.logger.warning(
-                f"[BRACKET GUARD] ✅ Emergency protective stop placed for {symbol}: {stop_side} {qty}x Stop @ {stop_price} (res={res})"
+                f"[BRACKET GUARD] ✅ Emergency protective stop placed for {symbol}: {stop_side} {place_qty}x Stop @ {stop_price} (res={res})"
             )
             return True
         except Exception as e:
@@ -2387,7 +2690,7 @@ class SupervisorAgent:
                         self._desync_start_time.pop(sym, None)
                         has_matching_broker_pos = any(
                             self._match_symbol_variant(sym, b_sym)
-                            for b_sym in broker_state.keys()
+                            for b_sym in broker_state
                         )
                         if not broker_state.get(sym) and not has_matching_broker_pos:
                             try:
@@ -2410,6 +2713,12 @@ class SupervisorAgent:
                                 "trade_key": preserved_meta.get("trade_key") if same_side else None,
                                 "session": preserved_meta.get("session") if same_side else None,
                                 "account_id": str(getattr(self, "account_id", None)) if getattr(self, "account_id", None) else None,
+                                "sl_ticks": preserved_meta.get("sl_ticks") if same_side else None,
+                                "tp_ticks": preserved_meta.get("tp_ticks") if same_side else None,
+                                "mfe_price": preserved_meta.get("mfe_price", bp["entry"]) if same_side else bp["entry"],
+                                "mae_price": preserved_meta.get("mae_price", bp["entry"]) if same_side else bp["entry"],
+                                "reason": preserved_meta.get("reason", "") if same_side else "",
+                                "metadata": preserved_meta.get("metadata", {}) if same_side else {},
                             }
                             self.active_positions[sym].append(pos_entry)
                             self.risk_agent.record_position_open(sym, bp["side"], bp["qty"], bp["entry"])
@@ -2417,8 +2726,8 @@ class SupervisorAgent:
 
                     # CASE 2: Broker > Internal (Orphan found or missed fill)
                     # We adopt these after a 60-second persistence check to ensure it's not a lagging report of a closed trade.
-                    
-                    # FIX: RECENTLY CLOSED GRACE — If we just closed this symbol internally, 
+
+                    # FIX: RECENTLY CLOSED GRACE — If we just closed this symbol internally,
                     # do NOT re-adopt it even if the broker still reports it (API index lag).
                     last_closed = self._recently_closed.get(sym, 0)
                     if now - last_closed < 60:
@@ -2433,7 +2742,7 @@ class SupervisorAgent:
                             f"Waiting 60s for persistence check before adoption."
                         )
                         continue
-                    
+
                     if now - desync_since < 60:
                         self.logger.info(f"ORPHAN for {sym} still showing. Persistence: {int(now - desync_since)}s/60s.")
                         continue
@@ -2442,14 +2751,14 @@ class SupervisorAgent:
                         f"ORPHAN PERSISTED for {sym}: Broker={broker_total_qty}, Internal={internal_total_qty}. "
                         f"Forcing sync to acquire unmanaged broker position."
                     )
-                    
+
                     preserved_meta = dict(internal_pos_list[0]) if internal_pos_list else {}
                     # Reset internal state to match broker's truth
                     while self.active_positions.get(sym):
                         self.clear_position(sym)
-                    
+
                     self._desync_start_time.pop(sym, None)
-                    
+
                     for bp in broker_state.get(sym, []):
                         if sym not in self.active_positions:
                             self.active_positions[sym] = []
@@ -2464,6 +2773,12 @@ class SupervisorAgent:
                             "trade_key": preserved_meta.get("trade_key") if same_side else None,
                             "session": preserved_meta.get("session") if same_side else None,
                             "account_id": str(getattr(self, "account_id", None)) if getattr(self, "account_id", None) else None,
+                            "sl_ticks": preserved_meta.get("sl_ticks") if same_side else None,
+                            "tp_ticks": preserved_meta.get("tp_ticks") if same_side else None,
+                            "mfe_price": preserved_meta.get("mfe_price", bp["entry"]) if same_side else bp["entry"],
+                            "mae_price": preserved_meta.get("mae_price", bp["entry"]) if same_side else bp["entry"],
+                            "reason": preserved_meta.get("reason", "") if same_side else "",
+                            "metadata": preserved_meta.get("metadata", {}) if same_side else {},
                         }
                         self.active_positions[sym].append(pos_entry)
                         self.risk_agent.record_position_open(sym, bp["side"], bp["qty"], bp["entry"])
@@ -2482,7 +2797,7 @@ class SupervisorAgent:
         import re
         def _norm(s: str) -> str:
             clean = str(s).lstrip("/").upper().strip()
-            m_con = re.search(r'\b([A-Z]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', clean)
+            m_con = re.search(r'\b([A-Z0-9]+)\.([FGHJKMNQUVXZ]\d{1,2})\b', clean)
             if m_con:
                 root, my = m_con.group(1), m_con.group(2)
                 if root.endswith("E") and len(root) > 3:
@@ -2495,14 +2810,14 @@ class SupervisorAgent:
         if a == b:
             return True
         # Check base symbol match if one is root: e.g. "MES" matching "MESZ6" or "MESZ26"
-        known_roots = ("MES", "MCL", "MGC", "MNQ", "ES", "NQ", "CL", "GC", "YM", "MYM")
+        known_roots = ("MES", "MCL", "MGC", "MNQ", "ES", "NQ", "CL", "GC", "YM", "MYM", "M6E", "6E", "M2K", "RTY")
         if a in known_roots and b.startswith(a):
             return True
         if b in known_roots and a.startswith(b):
             return True
-        # Futures month code + year variant: MESZ26 (2-digit year) vs MESZ6 (1-digit year)
-        m_a = re.match(r"^([A-Z]+[FGHJKMNQUVXZ])(\d{1,2})$", a)
-        m_b = re.match(r"^([A-Z]+[FGHJKMNQUVXZ])(\d{1,2})$", b)
+        # Futures month code + year variant: MESZ26 (2-digit year) vs MESZ6 (1-digit year), including M6EZ6/6EZ6
+        m_a = re.match(r"^([A-Z0-9]+[FGHJKMNQUVXZ])(\d{1,2})$", a)
+        m_b = re.match(r"^([A-Z0-9]+[FGHJKMNQUVXZ])(\d{1,2})$", b)
         if m_a and m_b and m_a.group(1) == m_b.group(1):
             return m_a.group(2)[-1] == m_b.group(2)[-1]
         return False
@@ -2536,10 +2851,12 @@ class SupervisorAgent:
             for off in self.official_symbols:
                 if off in cid_str or self._match_symbol_variant(off, cid_str):
                     return off
-            # Special check for e.g. CON.F.US.MCLE.X26 matching MCLX6
+            # Special check for e.g. CON.F.US.MCLE.X26 matching MCLX6, or CON.F.US.ENQ.M26 matching NQM6
+            import re
             for off in self.official_symbols:
-                base = off[:3] if len(off) >= 3 else off
-                if f".{base}." in cid_str or f".{base}E." in cid_str:
+                m_root = re.match(r"^([A-Z0-9]+?)(?:[FGHJKMNQUVXZ]\d{1,2})?$", off)
+                base = m_root.group(1) if m_root else off[:3]
+                if f".{base}." in cid_str or f".{base}E." in cid_str or f".E{base}." in cid_str:
                     return off
 
         # 2. String-based symbol resolution from payload fields
@@ -2636,7 +2953,7 @@ class SupervisorAgent:
             if qty is not None:
                 remaining_to_clear = int(qty)
                 self.risk_agent.record_position_close(symbol, qty=remaining_to_clear)
-                
+
                 total_qty = 0
                 weighted_entry_sum = 0.0
                 sample_pos = dict(self.active_positions[symbol][0])
@@ -2681,11 +2998,41 @@ class SupervisorAgent:
             curr_price = latest_bar.iloc[-1]["close"]
             tick_size = self.risk_agent.get_tick_size(sym)
             for pos in positions:
+                if pos.get("news_be_moved"):
+                    continue
                 side, entry, qty = pos["side"], pos["entry"], pos["qty"]
                 points_profit = (curr_price - entry) if side == "Buy" else (entry - curr_price)
                 ticks_profit = round(points_profit / tick_size)
                 if ticks_profit > 30:
-                    self.logger.info(f"[PRO-GUARD] Moving {sym} {side} to BE for {news_event}")
+                    exec_mode = getattr(getattr(self, "execution_agent", None), "mode", None) or os.getenv("MODE", "simulation").strip().lower()
+                    live_switch = os.getenv("ACTUAL_LIVE_TRADING", "false").strip().lower() == "true"
+                    use_brackets = os.getenv("USE_ORDER_BRACKETS", "true").strip().lower() == "true"
+
+                    if exec_mode == "live" and live_switch and use_brackets:
+                        stop_side = "Sell" if str(side).strip().lower() in ("buy", "long", "0") else "Buy"
+                        ts_str = f"{tick_size:.6f}".rstrip("0")
+                        prec = len(ts_str.split(".")[1]) if "." in ts_str else 0
+                        be_price = round(round(float(entry) / tick_size) * tick_size, prec)
+
+                        await self.loop.run_in_executor(None, self.client.cancel_open_orders_for_symbol, sym)
+                        res = await self.loop.run_in_executor(None, self.client.place_order, sym, qty, stop_side, "Stop", None, be_price)
+
+                        if isinstance(res, dict) and (res.get("status") in ("error", "rejected") or res.get("success") is False):
+                            self.logger.error(f"[PRO-GUARD] BE move failed for {sym}, flattening: {res}")
+                            self._close_in_flight[sym] = True
+                            self._close_in_flight_since[sym] = time.time()
+                            flat_res = await self.loop.run_in_executor(None, self.execution_agent.flatten_position, sym, qty, side)
+                            if flat_res and flat_res.get("status") in ("error", "rejected"):
+                                self._close_in_flight.pop(sym, None)
+                                self._close_in_flight_since.pop(sym, None)
+                        else:
+                            async with self._lock:
+                                pos["news_be_moved"] = True
+                            self.logger.info(f"[PRO-GUARD] Successfully moved {sym} {side} to BE for {news_event}")
+                    else:
+                        self.logger.info(f"[PRO-GUARD] Moving {sym} {side} to BE for {news_event} (simulated/non-API brackets)")
+                        async with self._lock:
+                            pos["news_be_moved"] = True
                 else:
                     self.logger.warning(f"[PRO-GUARD] Flattening {sym} {side} {qty}x before {news_event}")
                     self._close_in_flight[sym] = True
@@ -2733,8 +3080,8 @@ class SupervisorAgent:
         if hasattr(value, "item"):
             try:
                 return value.item()
-            except Exception:
-                pass
+            except (ValueError, TypeError, AttributeError):
+                return str(value)
 
         return str(value)
 
@@ -2804,18 +3151,24 @@ class SupervisorAgent:
         tz_ny = ZoneInfo('America/New_York')
         now_et = datetime.now(timezone.utc).astimezone(tz_ny)
         current_time_et = now_et.time()
-        
+        wd = now_et.weekday()
         asian_start_time = dt_time(18, 0)
-        
-        if current_time_et >= asian_start_time:
+
+        # During weekend closure (Fri >= 17:00, all Saturday, Sunday < 18:00),
+        # return Thursday 18:00 ET (start of Friday's trading session).
+        if (wd == 4 and current_time_et >= dt_time(17, 0)) or wd == 5 or (wd == 6 and current_time_et < asian_start_time):
+            days_back_to_thu = (wd - 3) % 7
+            session_start_et = (now_et - timedelta(days=days_back_to_thu)).replace(hour=18, minute=0, second=0, microsecond=0)
+        elif current_time_et >= asian_start_time:
             session_start_et = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
         else:
             session_start_et = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
-            
+
         return session_start_et.astimezone(timezone.utc)
 
     def get_current_session_trades(self) -> list:
         from datetime import datetime
+
         from src.utils.session_utils import get_trade_session
         session_start = self.get_current_session_start_utc()
         valid_trades = []
@@ -2829,8 +3182,8 @@ class SupervisorAgent:
                         if not item.get("session") or item.get("session") == "UNKNOWN":
                             item["session"] = get_trade_session(trade_dt)
                         valid_trades.append(item)
-                except Exception:
-                    pass
+                except (ValueError, TypeError):
+                    continue
         return valid_trades
 
 
@@ -2848,10 +3201,33 @@ class SupervisorAgent:
         self._status_indicators_cache[sym] = (key, ind)
         return ind
 
+    def _schedule_status_write(self) -> None:
+        """Schedule _write_status off the asyncio event loop onto _db_executor without piling up."""
+        loop = getattr(self, "loop", None)
+        db_exec = getattr(self, "_db_executor", None)
+        if loop is None or not hasattr(loop, "is_running") or not loop.is_running() or db_exec is None:
+            self._write_status()
+            return
+        if getattr(self, "_status_write_in_flight", False):
+            return
+        self._status_write_in_flight = True
+
+        def _run_status():
+            try:
+                self._write_status()
+            finally:
+                self._status_write_in_flight = False
+
+        try:
+            loop.run_in_executor(db_exec, _run_status)
+        except Exception:
+            self._status_write_in_flight = False
+            self._write_status()
+
     def _write_status(self):
         try:
             now_dt = datetime.now(timezone.utc).astimezone()
-            
+
             # [EXPERT FIX] Persistent Daily P&L Tracking
             # This ensures the dashboard matches Topstep's 'RP&L Today' even after restarts.
             current_bal = self.risk_agent.current_balance
@@ -2867,9 +3243,11 @@ class SupervisorAgent:
                 if self._balance_persistence_path.exists():
                     try:
                         opening_data = json.loads(self._balance_persistence_path.read_text())
-                    except Exception:
-                        pass
-                
+                        if not isinstance(opening_data, dict):
+                            opening_data = {}
+                    except (OSError, ValueError, TypeError):
+                        opening_data = {}
+
                 stored_account = str(opening_data.get("account_id") or "")
                 same_account = (not stored_account) or (stored_account == str(self.account_id))
                 persisted_peak = float(opening_data.get("peak_balance", 0.0)) if same_account else 0.0
@@ -2900,8 +3278,8 @@ class SupervisorAgent:
                             tmp_bal = self._balance_persistence_path.with_suffix(".tmp")
                             tmp_bal.write_text(json.dumps(opening_data, indent=2))
                             os.replace(tmp_bal, self._balance_persistence_path)
-                        except Exception:
-                            pass
+                        except OSError as e:
+                            self.logger.debug(f"Peak balance persistence update skipped: {e}")
 
             latest_prices = self._latest_prices_snapshot()
             open_pnl_values = []
@@ -2984,7 +3362,7 @@ class SupervisorAgent:
                 }
 
             market_open = self.news_agent.is_market_hours(now_dt)
-            
+
             # Persistent PnL History tracking
             # [EXPERT FIX] Use authoritative balance delta for session P&L
             if self._session_opening_balance and self.risk_agent.current_balance > 0:
@@ -3112,9 +3490,11 @@ class SupervisorAgent:
             if self.client:
                 self.client.stop_streaming()
                 self.client.stop_user_streaming()
+            if getattr(self, "_db_executor", None) is not None:
+                self._db_executor.shutdown(wait=True)
             if getattr(self, "database", None) and hasattr(self.database, "close"):
                 self.database.close()
-            
+
             # FIX: Forcefully cancel the main loop task if it's stuck in an await.
             # This ensures we don't hang on SIGINT if a REST call is hanging.
             if hasattr(self, '_main_task') and self._main_task and not self._main_task.done():
@@ -3258,6 +3638,7 @@ class SupervisorAgent:
                 return False
             self.stack_config = load_stack_config()
             self.strategy_config = get_strategy_config(self.stack_config)
+            self.feature_flags = get_feature_flags(self.stack_config)
             self.routing_config = get_routing_config(self.stack_config)
             self.filter_manager = FilterManager(self.routing_config)
             self.trade_router = TradeRouter(
@@ -3266,14 +3647,27 @@ class SupervisorAgent:
                 telemetry=self.telemetry,
                 filter_manager=self.filter_manager,
             )
-            if hasattr(self, "risk_agent") and self.risk_agent is not None and "symbol_brackets" in self.stack_config:
-                self.risk_agent.symbol_brackets = self.stack_config.get("symbol_brackets", {})
+            if hasattr(self, "risk_agent") and self.risk_agent is not None:
+                from src.config.settings import get_commissions_config
+                lock = getattr(self.risk_agent, "_lock", None)
+                with lock if lock is not None else contextlib.nullcontext():
+                    self.risk_agent.stack_config = self.stack_config
+                    self.risk_agent.symbol_brackets = get_symbol_brackets(self.stack_config)
+                    self.risk_agent.routing_config = self.routing_config
+                    self.risk_agent.feature_flags = self.feature_flags
+                    self.risk_agent.commissions_config = get_commissions_config(self.stack_config)
+                    target_raw = self.risk_agent.routing_config.get("daily_profit_target")
+                    self.risk_agent.daily_profit_target = Decimal(str(target_raw)) if target_raw not in (None, "") else None
+                    loss_raw = self.risk_agent.routing_config.get("daily_loss_halt")
+                    self.risk_agent.daily_loss_halt = Decimal(str(loss_raw)) if loss_raw not in (None, "") else None
+                    self.risk_agent.max_consecutive_losses = int(self.risk_agent.routing_config.get("max_consecutive_losses", 2))
+
             for official in self.official_symbols:
                 if official in self.strategy_agents:
                     try:
                         self.strategy_agents[official].reset()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"Strategy reset before reload skipped for {official}: {e}")
                     self.strategy_agents[official] = StrategyAgent(
                         official, strategy_config=self.strategy_config, telemetry=self.telemetry
                     )
@@ -3362,8 +3756,8 @@ class SupervisorAgent:
                     (stdout or b"").decode(errors="replace") + "\n--- STDERR ---\n" + (stderr or b"").decode(errors="replace"),
                     encoding="utf-8",
                 )
-            except Exception:
-                pass
+            except OSError as e:
+                self.logger.debug(f"Could not write saturday_optimizer_last_run.log: {e}")
 
             if proc.returncode == 0:
                 self._optimizer_failures = 0

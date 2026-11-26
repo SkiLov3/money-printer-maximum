@@ -191,7 +191,8 @@ strategies:
         trade_window_end_et: "14:00"
         use_vwap_filter: false
         use_ema200_filter: false
-        min_volume_ratio: 0.0
+        min_volume_ratio: 1.2
+        fade_reclaim_ticks: 2
         target_mode: risk_multiple
         risk_reward: 2.0
         fixed_target_ticks: 40
@@ -200,14 +201,16 @@ strategies:
         max_one_trade_per_session: true
 
         # ── Asian Session ──
-        min_or_ticks: 10
+        min_or_ticks: 15
         asian_enabled: true
         asian_opening_range_start_et: "18:00"
         asian_opening_range_end_et: "18:10"
         asian_trade_window_end_et: "20:30"
         asian_direction_mode: fade
         asian_risk_reward: 2.0
-        asian_min_or_ticks: 10
+        asian_min_or_ticks: 15
+        asian_fade_reclaim_ticks: 2
+        asian_min_volume_ratio: 1.2
         asian_use_vwap_filter: false
 
 # yamllint disable rule:line-length
@@ -229,7 +232,8 @@ symbol_brackets:
 
 routing:
   enabled: true
-  risk_per_trade_pct: 0.18    # Equity % risked per trade - set your own
+  risk_per_trade_pct: 0.25    # Equity % risked per trade - set your own
+  max_single_trade_risk_pct: 0.35  # Fraction of max_daily_loss allowed per trade (e.g. 0.25-0.35)
   daily_profit_target: 1500
   daily_loss_halt: 350
   max_consecutive_losses: 2

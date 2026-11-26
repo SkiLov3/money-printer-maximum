@@ -42,6 +42,8 @@ share/python-wheels/
 *.swo
 
 # Project specific
+config/trading_stack.yaml
+config/backups/
 logs/
 data/
 reports/

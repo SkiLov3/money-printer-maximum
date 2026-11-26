@@ -1,4 +1,4 @@
-# TopstepX Trading Swarm (v2.5.2)
+# TopstepX Trading Swarm (v2.5.3)
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-green.svg)](https://www.docker.com/)
